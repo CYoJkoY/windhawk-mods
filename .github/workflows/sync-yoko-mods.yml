@@ -1,0 +1,71 @@
+name: Sync Yoko mods
+
+description: Incrementally sync mods from CYoJkoY/Yoko-Windhawk-Mods.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-yoko-mods
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: CYoJkoY/Yoko-Windhawk-Mods
+  SOURCE_REF: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout destination
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Fetch source mods
+        env:
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          SOURCE_REF: ${{ env.SOURCE_REF }}
+        run: |
+          rm -rf "$RUNNER_TEMP/yoko-windhawk-mods"
+          git clone \
+            --depth 1 \
+            --filter=blob:none \
+            --sparse \
+            --branch "$SOURCE_REF" \
+            "https://github.com/$SOURCE_REPO.git" \
+            "$RUNNER_TEMP/yoko-windhawk-mods"
+          git -C "$RUNNER_TEMP/yoko-windhawk-mods" sparse-checkout set mods
+          test -d "$RUNNER_TEMP/yoko-windhawk-mods/mods"
+
+      - name: Incrementally update mods
+        run: |
+          mkdir -p mods
+          rsync -a \
+            --include='*/' \
+            --include='*.wh.cpp' \
+            --exclude='*' \
+            "$RUNNER_TEMP/yoko-windhawk-mods/mods/" \
+            mods/
+
+      - name: Commit changes when needed
+        env:
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          SOURCE_REF: ${{ env.SOURCE_REF }}
+        run: |
+          if git diff --quiet -- mods; then
+            echo 'No mod changes detected.'
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add mods
+          git commit -m 'sync: update mods from Yoko-Windhawk-Mods'
+          git push origin HEAD:main
