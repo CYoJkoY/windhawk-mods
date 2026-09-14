@@ -21,14 +21,15 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout destination
+      - name: Checkout main
         uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - name: Fetch latest destination main
-        run: git pull --rebase origin main
+      - name: Fetch latest main
+        run: git fetch origin main && git reset --hard origin/main
 
       - name: Fetch source mods
         env:
@@ -92,7 +93,7 @@ jobs:
 
           cp "$RUNNER_TEMP/source-yoko-mods.txt" "$MANIFEST_PATH"
 
-      - name: Commit changes when needed
+      - name: Commit and push to main
         run: |
           set -euo pipefail
 
@@ -105,16 +106,4 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add mods "$MANIFEST_PATH"
           git commit -m 'sync: reconcile mods from Yoko-Windhawk-Mods'
-
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-
-            echo "Push raced with main; rebasing (attempt $attempt)."
-            git fetch origin main
-            git rebase origin/main
-          done
-
-          echo 'ERROR: unable to push synchronized changes after 3 attempts.'
-          exit 1
+          git push origin HEAD:main
