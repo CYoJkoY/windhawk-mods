@@ -1,7 +1,5 @@
 name: Sync Yoko mods
 
-description: Incrementally sync mods from CYoJkoY/Yoko-Windhawk-Mods.
-
 on:
   schedule:
     - cron: '*/15 * * * *'
@@ -55,9 +53,6 @@ jobs:
             mods/
 
       - name: Commit changes when needed
-        env:
-          SOURCE_REPO: ${{ env.SOURCE_REPO }}
-          SOURCE_REF: ${{ env.SOURCE_REF }}
         run: |
           if git diff --quiet -- mods; then
             echo 'No mod changes detected.'
