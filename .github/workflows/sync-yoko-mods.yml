@@ -21,14 +21,15 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout destination
+      - name: Checkout main
         uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - name: Fetch latest destination main
-        run: git pull --rebase origin main
+      - name: Fetch latest main
+        run: git fetch origin main && git reset --hard origin/main
 
       - name: Fetch source mods
         env:
@@ -92,7 +93,7 @@ jobs:
 
           cp "$RUNNER_TEMP/source-yoko-mods.txt" "$MANIFEST_PATH"
 
-      - name: Commit changes when needed
+      - name: Commit and push to main
         run: |
           set -euo pipefail
 
