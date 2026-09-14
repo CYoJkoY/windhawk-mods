@@ -15,6 +15,7 @@ concurrency:
 env:
   SOURCE_REPO: CYoJkoY/Yoko-Windhawk-Mods
   SOURCE_REF: main
+  MANIFEST_PATH: .github/sync/yoko-mods.txt
 
 jobs:
   sync:
@@ -23,8 +24,11 @@ jobs:
       - name: Checkout destination
         uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           token: ${{ github.token }}
+
+      - name: Fetch latest destination main
+        run: git pull --rebase origin main
 
       - name: Fetch source mods
         env:
@@ -42,25 +46,75 @@ jobs:
           git -C "$RUNNER_TEMP/yoko-windhawk-mods" sparse-checkout set mods
           test -d "$RUNNER_TEMP/yoko-windhawk-mods/mods"
 
-      - name: Incrementally update mods
+      - name: Build source manifest
         run: |
-          mkdir -p mods
-          rsync -a \
-            --include='*/' \
-            --include='*.wh.cpp' \
-            --exclude='*' \
-            "$RUNNER_TEMP/yoko-windhawk-mods/mods/" \
-            mods/
+          git -C "$RUNNER_TEMP/yoko-windhawk-mods" ls-files | \
+            awk '/^mods\/.*\.wh\.cpp$/ { print }' | \
+            sort > "$RUNNER_TEMP/source-yoko-mods.txt"
+
+      - name: Reconcile managed mods
+        env:
+          MANIFEST_PATH: ${{ env.MANIFEST_PATH }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$MANIFEST_PATH")"
+
+          if [[ -f "$MANIFEST_PATH" ]]; then
+            sort -u "$MANIFEST_PATH" > "$RUNNER_TEMP/previous-yoko-mods.txt"
+          else
+            : > "$RUNNER_TEMP/previous-yoko-mods.txt"
+          fi
+
+          while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            if [[ "$path" != mods/*.wh.cpp ]]; then
+              echo "ERROR: invalid managed path: $path"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/previous-yoko-mods.txt"
+
+          comm -23 \
+            "$RUNNER_TEMP/previous-yoko-mods.txt" \
+            "$RUNNER_TEMP/source-yoko-mods.txt" | \
+          while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            rm -f -- "$path"
+          done
+
+          while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            mkdir -p "$(dirname "$path")"
+            install -m 0644 \
+              "$RUNNER_TEMP/yoko-windhawk-mods/$path" \
+              "$path"
+          done < "$RUNNER_TEMP/source-yoko-mods.txt"
+
+          cp "$RUNNER_TEMP/source-yoko-mods.txt" "$MANIFEST_PATH"
 
       - name: Commit changes when needed
         run: |
-          if git diff --quiet -- mods; then
-            echo 'No mod changes detected.'
+          set -euo pipefail
+
+          if git diff --quiet -- mods "$MANIFEST_PATH"; then
+            echo 'No Yoko mod changes detected.'
             exit 0
           fi
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add mods
-          git commit -m 'sync: update mods from Yoko-Windhawk-Mods'
-          git push origin HEAD:main
+          git add mods "$MANIFEST_PATH"
+          git commit -m 'sync: reconcile mods from Yoko-Windhawk-Mods'
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+
+            echo "Push raced with main; rebasing (attempt $attempt)."
+            git fetch origin main
+            git rebase origin/main
+          done
+
+          echo 'ERROR: unable to push synchronized changes after 3 attempts.'
+          exit 1
