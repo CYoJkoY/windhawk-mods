@@ -2,7 +2,7 @@ name: Sync Yoko mods
 
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '18 */4 * * *'
   workflow_dispatch:
 
 permissions:
