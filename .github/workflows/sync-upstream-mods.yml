@@ -1,14 +1,11 @@
 name: Generate upstream mods branch
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'mods/**/*.wh.cpp'
-      - '.github/workflows/sync-upstream-mods.yml'
-  schedule:
-    - cron: '18 */4 * * *'
+  workflow_run:
+    workflows:
+      - Sync Yoko mods
+    types:
+      - completed
   workflow_dispatch:
 
 permissions:
@@ -25,13 +22,18 @@ env:
 
 jobs:
   generate:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
         uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ github.token }}
+
+      - name: Fetch latest main
+        run: git fetch origin main && git reset --hard origin/main
 
       - name: Fetch upstream
         run: |
