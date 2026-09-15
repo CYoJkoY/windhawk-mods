@@ -8,7 +8,7 @@ on:
       - 'mods/**/*.wh.cpp'
       - '.github/workflows/sync-upstream-mods.yml'
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '17,47 * * * *'
   workflow_dispatch:
 
 permissions:
