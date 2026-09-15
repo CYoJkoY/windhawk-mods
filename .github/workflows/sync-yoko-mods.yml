@@ -2,7 +2,7 @@ name: Sync Yoko mods
 
 on:
   schedule:
-    - cron: '17,47 * * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: sync-yoko-mods
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   SOURCE_REPO: CYoJkoY/Yoko-Windhawk-Mods
