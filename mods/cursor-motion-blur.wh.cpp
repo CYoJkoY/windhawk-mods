@@ -23,7 +23,7 @@ Replaces your standard Windows cursor with a smooth, tapered motion blur trail w
 * **Zero Input Lag:** Draws directly off the hardware cursor coordinates.
 * **Game Detection:** Automatically disables itself when playing fullscreen or borderless DirectX games.
 * **Taskbar Friendly:** Retains native edge-detection for auto-hiding taskbars.
-* **Dynamic Rendering:** Idles at 0% CPU usage when the mouse is stationary.
+* **Bounded Rendering:** Keeps the overlay hidden when idle and redraws only the local trail region when motion blur is active.
 */
 // ==/WindhawkModReadme==
 
@@ -37,25 +37,34 @@ Replaces your standard Windows cursor with a smooth, tapered motion blur trail w
   $description: Velocity threshold to stop the blur. Must be lower than Trigger Velocity.
 - tail_offset_x: 6
   $name: Tail Offset X
-  $description: X-axis offset for where the tail connects to the cursor.
+  $description: X-axis offset for where the tail connects to the cursor (-128 to 128).
 - tail_offset_y: 10
   $name: Tail Offset Y
-  $description: Y-axis offset for where the tail connects to the cursor.
+  $description: Y-axis offset for where the tail connects to the cursor (-128 to 128).
 - tail_length: 10
   $name: Tail Length
-  $description: How many frames the blur trails behind you.
+  $description: How many frames the blur trails behind you (2 to 64).
 */
 // ==/WindhawkModSettings==
 
 #include <windows.h>
 #include <d2d1.h>
 #include <math.h>
+#include <algorithm>
 #include <shellapi.h>
 #include <deque>
 #include <vector>
 
+// Bound the geometry workload even if settings are edited outside the normal UI.
+constexpr int kMaxTailLength = 64;
+constexpr int kMaxTailOffset = 128;
+constexpr int kTrailBoundsPadding = 12;
+constexpr UINT_PTR kSmearTimerId = 1;
+
 // Global state variables
 HWND g_overlayHwnd = NULL;
+bool g_timerActive = false;
+volatile LONG g_shutdownRequested = 0;
 HANDLE g_threadHandle = NULL;
 std::deque<POINT> g_history;
 POINT g_lastPos = { 0, 0 }; 
@@ -69,8 +78,8 @@ ID2D1SolidColorBrush* g_pCapWhiteBrush = nullptr;
 // Cached backbuffer so we stop nuking the RAM every frame
 HDC g_hdcMem = NULL;
 HBITMAP g_hBitmap = NULL;
-int g_cachedVW = 0;
-int g_cachedVH = 0;
+int g_cachedBufferW = 0;
+int g_cachedBufferH = 0;
 
 // Settings cache
 float g_triggerVelocity = 25.0f;
@@ -80,15 +89,65 @@ int g_tailOffsetY = 10;
 int g_tailLength = 10;
 
 void LoadSettings() {
-    g_triggerVelocity = (float)Wh_GetIntSetting(L"trigger_velocity");
-    g_stopVelocity = (float)Wh_GetIntSetting(L"stop_velocity");
+    g_triggerVelocity = static_cast<float>(Wh_GetIntSetting(L"trigger_velocity"));
+    g_stopVelocity = static_cast<float>(Wh_GetIntSetting(L"stop_velocity"));
     g_tailOffsetX = Wh_GetIntSetting(L"tail_offset_x");
     g_tailOffsetY = Wh_GetIntSetting(L"tail_offset_y");
     g_tailLength = Wh_GetIntSetting(L"tail_length");
 
     if (g_triggerVelocity <= 0.0f) g_triggerVelocity = 25.0f;
     if (g_stopVelocity <= 0.0f) g_stopVelocity = 10.0f;
-    if (g_tailLength < 2) g_tailLength = 10; 
+    if (g_stopVelocity >= g_triggerVelocity) {
+        g_stopVelocity = g_triggerVelocity * 0.4f;
+    }
+
+    g_tailOffsetX = std::max(-kMaxTailOffset, std::min(g_tailOffsetX, kMaxTailOffset));
+    g_tailOffsetY = std::max(-kMaxTailOffset, std::min(g_tailOffsetY, kMaxTailOffset));
+    g_tailLength = std::max(2, std::min(g_tailLength, kMaxTailLength));
+}
+
+bool CreateRibbonGeometry(
+    ID2D1Factory* factory,
+    const std::vector<D2D1_POINT_2F>& left,
+    const std::vector<D2D1_POINT_2F>& right,
+    ID2D1PathGeometry** geometryOut) {
+    if (!factory || !geometryOut || left.empty() || left.size() != right.size()) {
+        return false;
+    }
+
+    *geometryOut = nullptr;
+    ID2D1PathGeometry* path = nullptr;
+    HRESULT hr = factory->CreatePathGeometry(&path);
+    if (FAILED(hr) || !path) {
+        return false;
+    }
+
+    ID2D1GeometrySink* sink = nullptr;
+    hr = path->Open(&sink);
+    if (FAILED(hr) || !sink) {
+        path->Release();
+        return false;
+    }
+
+    sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+    sink->BeginFigure(left.front(), D2D1_FIGURE_BEGIN_FILLED);
+    for (size_t i = 1; i < left.size(); ++i) {
+        sink->AddLine(left[i]);
+    }
+    for (size_t i = right.size(); i > 0; --i) {
+        sink->AddLine(right[i - 1]);
+    }
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+    hr = sink->Close();
+    sink->Release();
+    if (FAILED(hr)) {
+        path->Release();
+        return false;
+    }
+
+    *geometryOut = path;
+    return true;
 }
 
 bool IsGameRunning() {
@@ -142,37 +201,38 @@ bool IsGameRunning() {
 }
 
 VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    POINT pt;
-    GetCursorPos(&pt);
+    POINT pt = {};
+    if (!GetCursorPos(&pt)) {
+        return;
+    }
 
-    int dx = pt.x - g_lastPos.x;
-    int dy = pt.y - g_lastPos.y;
-    float velocity = sqrt((float)(dx * dx + dy * dy));
+    const float dx = static_cast<float>(pt.x) - static_cast<float>(g_lastPos.x);
+    const float dy = static_cast<float>(pt.y) - static_cast<float>(g_lastPos.y);
+    const float velocity = sqrt(dx * dx + dy * dy);
     g_lastPos = pt; 
 
     static DWORD lastFullscreenCheck = 0;
     static bool isGameCached = false;
     static bool isSmearing = false;
     static int lowVelocityFrames = 0;
-    static bool needsClear = false;
 
     if (dwTime - lastFullscreenCheck > 500) {
         isGameCached = IsGameRunning();
         lastFullscreenCheck = dwTime;
     }
 
-    int vX = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vH = GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
+    const int vX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vH = GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
+
+    if (vW <= 0 || vH <= 0) {
+        return;
+    }
 
     if (isGameCached) {
-        if (isSmearing || !g_history.empty() || needsClear) {
-            isSmearing = false;
-            g_history.clear();
-        } else {
-            return; 
-        }
+        isSmearing = false;
+        g_history.clear();
     } else {
         if (velocity > g_triggerVelocity && !isSmearing) {
             isSmearing = true;
@@ -204,39 +264,132 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
         }
     }
 
-    bool isDrawing = isSmearing || !g_history.empty();
-    
-    // Fix for the reviewer bitching about a permanent transparent overlay messing with exclusive presentation
-    static bool isWindowVisible = true;
-    if (isDrawing && !isWindowVisible) {
-        ShowWindow(hwnd, SW_SHOWNA);
-        isWindowVisible = true;
-    } else if (!isDrawing && !needsClear && isWindowVisible) {
-        ShowWindow(hwnd, SW_HIDE);
-        isWindowVisible = false;
+    const bool isDrawing = isSmearing || !g_history.empty();
+    static bool isWindowVisible = false;
+
+    if (!isDrawing) {
+        if (isWindowVisible) {
+            ShowWindow(hwnd, SW_HIDE);
+            isWindowVisible = false;
+        }
+
+        return;
     }
 
-    if (isDrawing || needsClear) {
-        HDC hdcScreen = GetDC(NULL);
+    // Samples are relative to the virtual-screen origin. Clip the backing surface
+    // to the recent trail bounds so rendering cost follows trail area, not desktop area.
+    int bufferX = 0;
+    int bufferY = 0;
+    int bufferW = 1;
+    int bufferH = 1;
+    if (!g_history.empty()) {
+        const POINT& firstPoint = g_history.front();
+        int minX = firstPoint.x + g_tailOffsetX;
+        int minY = firstPoint.y + g_tailOffsetY;
+        int maxX = minX;
+        int maxY = minY;
 
-        // Only allocate the massive bitmap once, or if the screen size physically changes
-        if (!g_hBitmap || g_cachedVW != vW || g_cachedVH != vH) {
-            if (g_hBitmap) DeleteObject(g_hBitmap);
-            if (g_hdcMem) DeleteDC(g_hdcMem);
-
-            g_hdcMem = CreateCompatibleDC(hdcScreen);
-            g_hBitmap = CreateCompatibleBitmap(hdcScreen, vW, vH);
-            SelectObject(g_hdcMem, g_hBitmap);
-
-            g_cachedVW = vW;
-            g_cachedVH = vH;
-
-            // If the bitmap changed, the render target needs to be rebuilt to match it
-            if (g_pDCRenderTarget) {
-                g_pDCRenderTarget->Release();
-                g_pDCRenderTarget = nullptr;
-            }
+        for (const POINT& historyPoint : g_history) {
+            const int pointX = historyPoint.x + g_tailOffsetX;
+            const int pointY = historyPoint.y + g_tailOffsetY;
+            minX = std::min(minX, pointX);
+            minY = std::min(minY, pointY);
+            maxX = std::max(maxX, pointX);
+            maxY = std::max(maxY, pointY);
         }
+
+        bufferX = std::max(0, std::min(vW - 1, minX - kTrailBoundsPadding));
+        bufferY = std::max(0, std::min(vH - 1, minY - kTrailBoundsPadding));
+        const int bufferRight = std::max(
+            bufferX + 1, std::min(vW, maxX + kTrailBoundsPadding + 1));
+        const int bufferBottom = std::max(
+            bufferY + 1, std::min(vH, maxY + kTrailBoundsPadding + 1));
+        bufferW = bufferRight - bufferX;
+        bufferH = bufferBottom - bufferY;
+    }
+
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) {
+        if (isWindowVisible) {
+            ShowWindow(hwnd, SW_HIDE);
+            isWindowVisible = false;
+        }
+        return;
+    }
+
+    // Keep spare capacity so one-pixel movements don't resize the bitmap on every
+    // frame. Grow geometrically; shrink only after the trail stays much smaller.
+    const bool needsGrowth =
+        bufferW > g_cachedBufferW || bufferH > g_cachedBufferH;
+    const bool needsShrink =
+        g_hBitmap && bufferW * 3 < g_cachedBufferW &&
+        bufferH * 3 < g_cachedBufferH;
+
+    if (!g_hBitmap || needsGrowth || needsShrink) {
+        int surfaceW = bufferW;
+        int surfaceH = bufferH;
+        if (g_hBitmap && !needsShrink) {
+            surfaceW = bufferW > g_cachedBufferW
+                ? std::max(bufferW, std::min(vW, g_cachedBufferW * 2))
+                : g_cachedBufferW;
+            surfaceH = bufferH > g_cachedBufferH
+                ? std::max(bufferH, std::min(vH, g_cachedBufferH * 2))
+                : g_cachedBufferH;
+        }
+
+        if (g_hdcMem) {
+            DeleteDC(g_hdcMem);
+            g_hdcMem = NULL;
+        }
+        if (g_hBitmap) {
+            DeleteObject(g_hBitmap);
+            g_hBitmap = NULL;
+        }
+
+        g_hdcMem = CreateCompatibleDC(hdcScreen);
+        if (g_hdcMem) {
+            g_hBitmap = CreateCompatibleBitmap(hdcScreen, surfaceW, surfaceH);
+        }
+
+        if (!g_hdcMem || !g_hBitmap) {
+            if (g_hdcMem) {
+                DeleteDC(g_hdcMem);
+                g_hdcMem = NULL;
+            }
+            if (g_hBitmap) {
+                DeleteObject(g_hBitmap);
+                g_hBitmap = NULL;
+            }
+            ReleaseDC(NULL, hdcScreen);
+            if (isWindowVisible) {
+                ShowWindow(hwnd, SW_HIDE);
+                isWindowVisible = false;
+            }
+            return;
+        }
+
+        HGDIOBJ previousBitmap = SelectObject(g_hdcMem, g_hBitmap);
+        if (!previousBitmap || previousBitmap == HGDI_ERROR) {
+            DeleteDC(g_hdcMem);
+            g_hdcMem = NULL;
+            DeleteObject(g_hBitmap);
+            g_hBitmap = NULL;
+            ReleaseDC(NULL, hdcScreen);
+            if (isWindowVisible) {
+                ShowWindow(hwnd, SW_HIDE);
+                isWindowVisible = false;
+            }
+            return;
+        }
+
+        g_cachedBufferW = surfaceW;
+        g_cachedBufferH = surfaceH;
+
+        if (g_pDCRenderTarget) {
+            g_pDCRenderTarget->Release();
+            g_pDCRenderTarget = nullptr;
+        }
+    }
 
         // Initialize Direct2D Render Target if we don't have one
         if (!g_pDCRenderTarget && g_pD2DFactory) {
@@ -258,37 +411,95 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
             }
         }
 
+        if (!g_pDCRenderTarget || !g_pCapBlackBrush || !g_pCapWhiteBrush) {
+            if (g_pCapBlackBrush) { g_pCapBlackBrush->Release(); g_pCapBlackBrush = nullptr; }
+            if (g_pCapWhiteBrush) { g_pCapWhiteBrush->Release(); g_pCapWhiteBrush = nullptr; }
+            if (g_pDCRenderTarget) { g_pDCRenderTarget->Release(); g_pDCRenderTarget = nullptr; }
+            ReleaseDC(NULL, hdcScreen);
+            if (isWindowVisible) {
+                ShowWindow(hwnd, SW_HIDE);
+                isWindowVisible = false;
+            }
+            return;
+        }
+
         if (g_pDCRenderTarget) {
-            RECT rc = { 0, 0, vW, vH };
-            g_pDCRenderTarget->BindDC(g_hdcMem, &rc);
-            
+            RECT rc = { 0, 0, bufferW, bufferH };
+            const HRESULT bindResult = g_pDCRenderTarget->BindDC(g_hdcMem, &rc);
+            if (FAILED(bindResult)) {
+                if (g_pCapBlackBrush) {
+                    g_pCapBlackBrush->Release();
+                    g_pCapBlackBrush = nullptr;
+                }
+                if (g_pCapWhiteBrush) {
+                    g_pCapWhiteBrush->Release();
+                    g_pCapWhiteBrush = nullptr;
+                }
+                g_pDCRenderTarget->Release();
+                g_pDCRenderTarget = nullptr;
+                ReleaseDC(NULL, hdcScreen);
+                if (isWindowVisible) {
+                    ShowWindow(hwnd, SW_HIDE);
+                    isWindowVisible = false;
+                }
+                return;
+            }
+
             g_pDCRenderTarget->BeginDraw();
             g_pDCRenderTarget->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f)); 
 
             if (isDrawing && g_history.size() >= 2) {
                 // CHAIKIN SUBDIVISION: Mathematically curve the rigid mouse coordinates into a dense bezier curve
-                std::vector<D2D1_POINT_2F> smoothed;
-                for (auto& p : g_history) {
-                    smoothed.push_back(D2D1::Point2F((float)p.x + g_tailOffsetX, (float)p.y + g_tailOffsetY));
+                // Retain bounded scratch capacity across frames. Two subdivision passes
+                // expand at most 64 samples to 256 points.
+                static std::vector<D2D1_POINT_2F> smoothed;
+                static std::vector<D2D1_POINT_2F> subdivision;
+                static std::vector<D2D1_POINT_2F> leftOutline;
+                static std::vector<D2D1_POINT_2F> rightOutline;
+                static std::vector<D2D1_POINT_2F> leftCore;
+                static std::vector<D2D1_POINT_2F> rightCore;
+
+                const size_t scratchCapacity = static_cast<size_t>(g_tailLength) * 4;
+                if (smoothed.capacity() < scratchCapacity) smoothed.reserve(scratchCapacity);
+                if (subdivision.capacity() < scratchCapacity) subdivision.reserve(scratchCapacity);
+                if (leftOutline.capacity() < scratchCapacity) leftOutline.reserve(scratchCapacity);
+                if (rightOutline.capacity() < scratchCapacity) rightOutline.reserve(scratchCapacity);
+                if (leftCore.capacity() < scratchCapacity) leftCore.reserve(scratchCapacity);
+                if (rightCore.capacity() < scratchCapacity) rightCore.reserve(scratchCapacity);
+
+                smoothed.clear();
+                subdivision.clear();
+                leftOutline.clear();
+                rightOutline.clear();
+                leftCore.clear();
+                rightCore.clear();
+
+                for (const POINT& point : g_history) {
+                    smoothed.push_back(D2D1::Point2F(
+                        static_cast<float>(point.x + g_tailOffsetX - bufferX),
+                        static_cast<float>(point.y + g_tailOffsetY - bufferY)));
                 }
 
                 for (int iter = 0; iter < 2; ++iter) {
                     if (smoothed.size() < 3) break;
-                    std::vector<D2D1_POINT_2F> next_s;
-                    next_s.push_back(smoothed.front());
+                    subdivision.clear();
+                    subdivision.push_back(smoothed.front());
                     for (size_t i = 0; i < smoothed.size() - 1; ++i) {
-                        D2D1_POINT_2F p0 = smoothed[i];
-                        D2D1_POINT_2F p1 = smoothed[i+1];
-                        next_s.push_back(D2D1::Point2F(0.75f * p0.x + 0.25f * p1.x, 0.75f * p0.y + 0.25f * p1.y));
-                        next_s.push_back(D2D1::Point2F(0.25f * p0.x + 0.75f * p1.x, 0.25f * p0.y + 0.75f * p1.y));
+                        const D2D1_POINT_2F p0 = smoothed[i];
+                        const D2D1_POINT_2F p1 = smoothed[i + 1];
+                        subdivision.push_back(D2D1::Point2F(
+                            0.75f * p0.x + 0.25f * p1.x,
+                            0.75f * p0.y + 0.25f * p1.y));
+                        subdivision.push_back(D2D1::Point2F(
+                            0.25f * p0.x + 0.75f * p1.x,
+                            0.25f * p0.y + 0.75f * p1.y));
                     }
-                    next_s.push_back(smoothed.back());
-                    smoothed = next_s;
+                    subdivision.push_back(smoothed.back());
+                    smoothed.swap(subdivision);
                 }
 
                 // PROCEDURAL MESH GENERATION: Calculate perpendicular normals to build the left and right walls of the streak
-                size_t s_len = smoothed.size();
-                std::vector<D2D1_POINT_2F> leftOutline, rightOutline, leftCore, rightCore;
+                const size_t s_len = smoothed.size();
 
                 for (size_t i = 0; i < s_len; ++i) {
                     float dx, dy;
@@ -319,66 +530,75 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
                     rightCore.push_back(D2D1::Point2F(smoothed[i].x - nx * coreW, smoothed[i].y - ny * coreW));
                 }
 
-                // Stitch the left and right walls together to cast the solid custom polygon meshes
+                // Skip a frame if any Direct2D geometry allocation fails.
                 ID2D1PathGeometry* pOutlineGeom = nullptr;
-                ID2D1GeometrySink* pSink = nullptr;
-                g_pD2DFactory->CreatePathGeometry(&pOutlineGeom);
-                pOutlineGeom->Open(&pSink);
-                pSink->SetFillMode(D2D1_FILL_MODE_WINDING); // Stop cutting donut holes in the overlaps
-                pSink->BeginFigure(leftOutline[0], D2D1_FIGURE_BEGIN_FILLED);
-                for (size_t i = 1; i < leftOutline.size(); ++i) pSink->AddLine(leftOutline[i]);
-                for (int i = (int)rightOutline.size() - 1; i >= 0; --i) pSink->AddLine(rightOutline[i]);
-                pSink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                pSink->Close();
-                pSink->Release();
-
                 ID2D1PathGeometry* pCoreGeom = nullptr;
-                g_pD2DFactory->CreatePathGeometry(&pCoreGeom);
-                pCoreGeom->Open(&pSink);
-                pSink->SetFillMode(D2D1_FILL_MODE_WINDING); // Stop cutting donut holes in the overlaps
-                pSink->BeginFigure(leftCore[0], D2D1_FIGURE_BEGIN_FILLED);
-                for (size_t i = 1; i < leftCore.size(); ++i) pSink->AddLine(leftCore[i]);
-                for (int i = (int)rightCore.size() - 1; i >= 0; --i) pSink->AddLine(rightCore[i]);
-                pSink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                pSink->Close();
-                pSink->Release();
-
-                // Create the perfectly rounded head caps
                 ID2D1EllipseGeometry* pBlackEllipse = nullptr;
                 ID2D1EllipseGeometry* pWhiteEllipse = nullptr;
-                g_pD2DFactory->CreateEllipseGeometry(D2D1::Ellipse(smoothed[0], 10.0f, 10.0f), &pBlackEllipse);
-                g_pD2DFactory->CreateEllipseGeometry(D2D1::Ellipse(smoothed[0], 6.0f, 6.0f), &pWhiteEllipse);
-
-                // Combine the head cap and the tail into a single unified Geometry Group for the black layer
-                ID2D1Geometry* blackGeoms[2] = { pOutlineGeom, pBlackEllipse };
                 ID2D1GeometryGroup* pBlackGroup = nullptr;
-                g_pD2DFactory->CreateGeometryGroup(D2D1_FILL_MODE_WINDING, blackGeoms, 2, &pBlackGroup);
-
-                // Combine the head cap and the tail into a single unified Geometry Group for the white core
-                ID2D1Geometry* whiteGeoms[2] = { pCoreGeom, pWhiteEllipse };
                 ID2D1GeometryGroup* pWhiteGroup = nullptr;
-                g_pD2DFactory->CreateGeometryGroup(D2D1_FILL_MODE_WINDING, whiteGeoms, 2, &pWhiteGroup);
 
-                // Fill the unified shapes! Because it's one geometry, overlapping intersections seamlessly melt together instead of stacking opacity.
-                g_pDCRenderTarget->FillGeometry(pBlackGroup, g_pCapBlackBrush);
-                g_pDCRenderTarget->FillGeometry(pWhiteGroup, g_pCapWhiteBrush);
+                bool geometryReady =
+                    CreateRibbonGeometry(g_pD2DFactory, leftOutline, rightOutline, &pOutlineGeom) &&
+                    CreateRibbonGeometry(g_pD2DFactory, leftCore, rightCore, &pCoreGeom);
 
-                pBlackGroup->Release();
-                pWhiteGroup->Release();
-                pBlackEllipse->Release();
-                pWhiteEllipse->Release();
-                pOutlineGeom->Release();
-                pCoreGeom->Release();
+                if (geometryReady) {
+                    geometryReady =
+                        SUCCEEDED(g_pD2DFactory->CreateEllipseGeometry(
+                            D2D1::Ellipse(smoothed[0], 10.0f, 10.0f), &pBlackEllipse)) &&
+                        pBlackEllipse &&
+                        SUCCEEDED(g_pD2DFactory->CreateEllipseGeometry(
+                            D2D1::Ellipse(smoothed[0], 6.0f, 6.0f), &pWhiteEllipse)) &&
+                        pWhiteEllipse;
+                }
 
-                needsClear = true; 
-            } else {
-                needsClear = false; 
+                if (geometryReady) {
+                    ID2D1Geometry* blackGeometries[2] = { pOutlineGeom, pBlackEllipse };
+                    geometryReady =
+                        SUCCEEDED(g_pD2DFactory->CreateGeometryGroup(
+                            D2D1_FILL_MODE_WINDING, blackGeometries, 2, &pBlackGroup)) &&
+                        pBlackGroup;
+                }
+
+                if (geometryReady) {
+                    ID2D1Geometry* whiteGeometries[2] = { pCoreGeom, pWhiteEllipse };
+                    geometryReady =
+                        SUCCEEDED(g_pD2DFactory->CreateGeometryGroup(
+                            D2D1_FILL_MODE_WINDING, whiteGeometries, 2, &pWhiteGroup)) &&
+                        pWhiteGroup;
+                }
+
+                if (geometryReady) {
+                    g_pDCRenderTarget->FillGeometry(pBlackGroup, g_pCapBlackBrush);
+                    g_pDCRenderTarget->FillGeometry(pWhiteGroup, g_pCapWhiteBrush);
+                }
+
+                if (pBlackGroup) pBlackGroup->Release();
+                if (pWhiteGroup) pWhiteGroup->Release();
+                if (pBlackEllipse) pBlackEllipse->Release();
+                if (pWhiteEllipse) pWhiteEllipse->Release();
+                if (pOutlineGeom) pOutlineGeom->Release();
+                if (pCoreGeom) pCoreGeom->Release();
             }
 
-            HRESULT hr = g_pDCRenderTarget->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) {
+            const HRESULT drawResult = g_pDCRenderTarget->EndDraw();
+            if (FAILED(drawResult)) {
+                if (g_pCapBlackBrush) {
+                    g_pCapBlackBrush->Release();
+                    g_pCapBlackBrush = nullptr;
+                }
+                if (g_pCapWhiteBrush) {
+                    g_pCapWhiteBrush->Release();
+                    g_pCapWhiteBrush = nullptr;
+                }
                 g_pDCRenderTarget->Release();
                 g_pDCRenderTarget = nullptr;
+                ReleaseDC(NULL, hdcScreen);
+                if (isWindowVisible) {
+                    ShowWindow(hwnd, SW_HIDE);
+                    isWindowVisible = false;
+                }
+                return;
             }
         }
 
@@ -387,14 +607,36 @@ VOID CALLBACK SmearTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTim
         blend.SourceConstantAlpha = 255; 
         blend.AlphaFormat = AC_SRC_ALPHA;
 
-        POINT ptPos = { vX, vY };
-        SIZE sizeWnd = { vW, vH };
+        POINT ptPos = { vX + bufferX, vY + bufferY };
+        SIZE sizeWnd = { bufferW, bufferH };
         POINT ptSrc = { 0, 0 };
 
-        UpdateLayeredWindow(hwnd, hdcScreen, &ptPos, &sizeWnd, g_hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+        if (UpdateLayeredWindow(hwnd, hdcScreen, &ptPos, &sizeWnd, g_hdcMem,
+                                &ptSrc, 0, &blend, ULW_ALPHA)) {
+            if (!isWindowVisible) {
+                ShowWindow(hwnd, SW_SHOWNA);
+                isWindowVisible = true;
+            }
+        } else if (isWindowVisible) {
+            ShowWindow(hwnd, SW_HIDE);
+            isWindowVisible = false;
+        }
 
         ReleaseDC(NULL, hdcScreen);
+}
+
+LRESULT CALLBACK OverlayWndProc(
+    HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_CLOSE) {
+        if (g_timerActive) {
+            KillTimer(hwnd, kSmearTimerId);
+            g_timerActive = false;
+        }
+        PostQuitMessage(0);
+        return 0;
     }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
@@ -410,11 +652,14 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
     const wchar_t CLASS_NAME[] = L"SmearFrameOverlayClass";
 
     WNDCLASS wc = { };
-    wc.lpfnWndProc = DefWindowProc; 
+    wc.lpfnWndProc = OverlayWndProc; 
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
 
-    RegisterClass(&wc);
+    if (!RegisterClass(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Wh_Log(L"RegisterClass failed: %lu", GetLastError());
+        return 0;
+    }
 
     int screenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int screenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -430,29 +675,53 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
         NULL, NULL, hInstance, NULL
     );
 
-    if (!g_overlayHwnd) return 0;
+    if (!g_overlayHwnd) {
+        UnregisterClass(CLASS_NAME, hInstance);
+        return 0;
+    }
 
-    ShowWindow(g_overlayHwnd, SW_SHOWNA);
-    
     GetCursorPos(&g_lastPos);
 
-    SetTimer(g_overlayHwnd, 1, USER_TIMER_MINIMUM, SmearTimerProc);
+    g_timerActive = SetTimer(
+        g_overlayHwnd, kSmearTimerId, USER_TIMER_MINIMUM, SmearTimerProc) != 0;
+    if (!g_timerActive) {
+        Wh_Log(L"Unable to start cursor sampling timer");
+        PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
+    }
+
+    if (InterlockedCompareExchange(&g_shutdownRequested, 0, 0) != 0) {
+        PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
+    }
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // Clean up our massive GPU footprint before checking out
+    if (g_timerActive && g_overlayHwnd) {
+        KillTimer(g_overlayHwnd, kSmearTimerId);
+        g_timerActive = false;
+    }
+
     if (g_pCapWhiteBrush) { g_pCapWhiteBrush->Release(); g_pCapWhiteBrush = nullptr; }
     if (g_pCapBlackBrush) { g_pCapBlackBrush->Release(); g_pCapBlackBrush = nullptr; }
     if (g_pDCRenderTarget) { g_pDCRenderTarget->Release(); g_pDCRenderTarget = nullptr; }
     if (g_pD2DFactory) { g_pD2DFactory->Release(); g_pD2DFactory = nullptr; }
 
-    if (g_hBitmap) DeleteObject(g_hBitmap);
-    if (g_hdcMem) DeleteDC(g_hdcMem);
-    DestroyWindow(g_overlayHwnd);
+    // The bitmap is selected into the memory DC, so release the DC first.
+    if (g_hdcMem) {
+        DeleteDC(g_hdcMem);
+        g_hdcMem = NULL;
+    }
+    if (g_hBitmap) {
+        DeleteObject(g_hBitmap);
+        g_hBitmap = NULL;
+    }
+    if (g_overlayHwnd) {
+        DestroyWindow(g_overlayHwnd);
+        g_overlayHwnd = nullptr;
+    }
     UnregisterClass(CLASS_NAME, hInstance);
 
     CoUninitialize();
@@ -462,12 +731,13 @@ DWORD WINAPI OverlayThreadProc(LPVOID lpParam) {
 BOOL WhTool_ModInit() {
     LoadSettings();
     g_threadHandle = CreateThread(NULL, 0, OverlayThreadProc, NULL, 0, NULL);
-    return TRUE;
+    return g_threadHandle != nullptr;
 }
 
 void WhTool_ModUninit() {
+    InterlockedExchange(&g_shutdownRequested, 1);
     if (g_overlayHwnd) {
-        PostMessage(g_overlayHwnd, WM_QUIT, 0, 0);
+        PostMessageW(g_overlayHwnd, WM_CLOSE, 0, 0);
     }
     if (g_threadHandle) {
         WaitForSingleObject(g_threadHandle, INFINITE);
