@@ -437,6 +437,12 @@ This mod is derived in part from the Windhawk **Cursor Motion Blur** mod by Thea
 */
 // ==/WindhawkModSettings==
 
+// Modular sources are amalgamated by tools/bundle.py. The include order is
+// the definition order of the single generated translation unit.
+
+// System includes plus the shared Windhawk and Win32 helper headers.
+
+
 #include <windows.h>
 #include <windhawk_utils.h>
 #include <d2d1.h>
@@ -459,6 +465,656 @@ This mod is derived in part from the Windhawk **Cursor Motion Blur** mod by Thea
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002u
 #endif
+
+// Repository-wide helpers. The paths stay relative to this header so
+// the amalgamator can inline them in the same way as local modules.
+
+// Header-only helpers around the Windhawk API.
+//
+// This file is inlined by tools/bundle.py, so it must stay self-contained and
+// must never include another repository header. Every function is inline so
+// the amalgamated translation unit keeps a single definition.
+
+#include <windows.h>
+
+#include <windhawk_api.h>
+#include <windhawk_utils.h>
+
+#include <string>
+
+namespace yoko {
+
+// Reads an integer setting and clamps it to the documented range.
+//
+// Windhawk returns 0 for a missing value and does not reject out-of-range
+// input, so the clamp has to happen here. An inverted range is a programming
+// error in the settings block; it is logged and collapsed to the lower bound
+// instead of producing undefined behavior.
+inline int GetClampedIntSetting(const wchar_t* path, int minimum, int maximum) {
+    if (path == nullptr) {
+        Wh_Log(L"GetClampedIntSetting called without a setting path");
+        return minimum;
+    }
+    if (maximum < minimum) {
+        Wh_Log(L"GetClampedIntSetting range is inverted for %s", path);
+        return minimum;
+    }
+    const int value = Wh_GetIntSetting(path);
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
+}
+
+// Reads a string setting and falls back when the value is absent.
+//
+// WindhawkUtils::StringSetting owns the buffer, so the result is copied before
+// the temporary goes out of scope.
+inline std::wstring GetStringSetting(const wchar_t* path,
+                                     const wchar_t* fallback) {
+    const wchar_t* safeFallback = fallback != nullptr ? fallback : L"";
+    if (path == nullptr) {
+        Wh_Log(L"GetStringSetting called without a setting path");
+        return safeFallback;
+    }
+    WindhawkUtils::StringSetting value =
+        WindhawkUtils::StringSetting::make(path);
+    const wchar_t* text = value.get();
+    if (text == nullptr) {
+        return safeFallback;
+    }
+    return text;
+}
+
+// Logs the current thread's last error next to a short context string.
+//
+// The error is captured first so the logging call itself cannot replace it.
+inline void LogLastError(const wchar_t* context) {
+    const DWORD error = GetLastError();
+    Wh_Log(L"%s failed: %lu", context != nullptr ? context : L"Win32 call",
+           error);
+}
+
+}  // namespace yoko
+
+// Header-only pattern scanner for loaded modules.
+//
+// The scanner reads through ReadProcessMemory, so it works for both the
+// current process and another process, and it can never fault on an address
+// that went away. Every section walk is bounded by the PE header sizes and by
+// an explicit byte budget. This file is inlined by tools/bundle.py and must
+// stay self-contained.
+
+#include <windows.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+#include <vector>
+
+namespace yoko::detail {
+
+struct PatternByte {
+    std::uint8_t value;
+    bool wildcard;
+};
+
+inline int HexDigitValue(wchar_t character) {
+    if (character >= L'0' && character <= L'9') {
+        return static_cast<int>(character - L'0');
+    }
+    if (character >= L'a' && character <= L'f') {
+        return static_cast<int>(character - L'a') + 10;
+    }
+    if (character >= L'A' && character <= L'F') {
+        return static_cast<int>(character - L'A') + 10;
+    }
+    return -1;
+}
+
+inline bool IsPatternSpace(wchar_t character) {
+    return character == L' ' || character == L'\t' || character == L'\n' ||
+           character == L'\r';
+}
+
+// Parses an IDA-style pattern such as L"48 8B ?? 05". Both "?" and "??" are
+// accepted for a wildcard byte. Returns false for empty or malformed input.
+inline bool ParsePattern(std::wstring_view text,
+                         std::vector<PatternByte>& pattern) {
+    pattern.clear();
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const wchar_t character = text[index];
+        if (IsPatternSpace(character)) {
+            ++index;
+            continue;
+        }
+        if (character == L'?') {
+            pattern.push_back({0, true});
+            ++index;
+            if (index < text.size() && text[index] == L'?') {
+                ++index;
+            }
+            continue;
+        }
+        const int high = HexDigitValue(character);
+        if (high < 0) {
+            pattern.clear();
+            return false;
+        }
+        ++index;
+        if (index >= text.size()) {
+            pattern.clear();
+            return false;
+        }
+        const int low = HexDigitValue(text[index]);
+        if (low < 0) {
+            pattern.clear();
+            return false;
+        }
+        ++index;
+        pattern.push_back(
+            {static_cast<std::uint8_t>((high << 4) | low), false});
+    }
+    return !pattern.empty();
+}
+
+inline bool MatchesAt(const std::uint8_t* candidate,
+                      const std::vector<PatternByte>& pattern) {
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        if (!pattern[i].wildcard && candidate[i] != pattern[i].value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace yoko::detail
+
+namespace yoko {
+
+// Scans one module inside a target process.
+//
+// Usage:
+//   RemotePatternScanner scanner(GetCurrentProcess(),
+//                                reinterpret_cast<std::uintptr_t>(
+//                                    GetModuleHandle(L"user32.dll")));
+//   std::uint8_t* hit = nullptr;
+//   if (scanner.Find(L"48 8B ?? 05", &hit)) { ... }
+class RemotePatternScanner {
+public:
+    RemotePatternScanner(HANDLE process, std::uintptr_t imageBase)
+        : process_(process), imageBase_(imageBase) {}
+
+    // Largest number of bytes the scanner will touch in one call. A pattern
+    // that is not found inside this budget reports failure instead of walking
+    // an unexpectedly large image.
+    static constexpr std::size_t kDefaultByteBudget = 256u * 1024u * 1024u;
+
+    bool Find(std::wstring_view patternText, std::uint8_t** match,
+              std::size_t byteBudget = kDefaultByteBudget) const {
+        if (match == nullptr) {
+            return false;
+        }
+        *match = nullptr;
+        if (process_ == nullptr || process_ == INVALID_HANDLE_VALUE ||
+            imageBase_ == 0) {
+            return false;
+        }
+
+        std::vector<detail::PatternByte> pattern;
+        if (!detail::ParsePattern(patternText, pattern)) {
+            return false;
+        }
+        if (pattern.size() > byteBudget) {
+            return false;
+        }
+
+        const auto base = reinterpret_cast<const std::uint8_t*>(imageBase_);
+        IMAGE_DOS_HEADER dosHeader = {};
+        if (!ReadRemote(base, sizeof(dosHeader), &dosHeader)) {
+            return false;
+        }
+        if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew <= 0) {
+            return false;
+        }
+
+        const std::uintptr_t ntOffset = static_cast<std::uintptr_t>(
+            static_cast<DWORD>(dosHeader.e_lfanew));
+        if (ntOffset > UINTPTR_MAX - imageBase_) {
+            return false;
+        }
+        const auto ntBase = reinterpret_cast<const std::uint8_t*>(
+            imageBase_ + ntOffset);
+
+        DWORD signature = 0;
+        if (!ReadRemote(ntBase, sizeof(signature), &signature)) {
+            return false;
+        }
+        if (signature != IMAGE_NT_SIGNATURE) {
+            return false;
+        }
+
+        constexpr std::size_t kOptionalHeaderOffset =
+            offsetof(IMAGE_NT_HEADERS32, OptionalHeader);
+        if (ntOffset > SIZE_MAX - kOptionalHeaderOffset) {
+            return false;
+        }
+        const std::size_t optionalAddress = ntOffset + kOptionalHeaderOffset;
+        if (optionalAddress > UINTPTR_MAX - imageBase_) {
+            return false;
+        }
+        const auto optionalBase = reinterpret_cast<const std::uint8_t*>(
+            imageBase_ + optionalAddress);
+        WORD optionalMagic = 0;
+        if (!ReadRemote(optionalBase, sizeof(optionalMagic), &optionalMagic)) {
+            return false;
+        }
+        const bool pe32 = optionalMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        const bool pe64 = optionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        if (!pe32 && !pe64) {
+            return false;
+        }
+
+        DWORD sectionCount = 0;
+        DWORD sizeOfImage = 0;
+        WORD sizeOfOptionalHeader = 0;
+        if (pe64) {
+            IMAGE_NT_HEADERS64 headers = {};
+            if (!ReadRemote(ntBase, sizeof(headers), &headers)) {
+                return false;
+            }
+            sectionCount = headers.FileHeader.NumberOfSections;
+            sizeOfOptionalHeader = headers.FileHeader.SizeOfOptionalHeader;
+            sizeOfImage = headers.OptionalHeader.SizeOfImage;
+        } else {
+            IMAGE_NT_HEADERS32 headers = {};
+            if (!ReadRemote(ntBase, sizeof(headers), &headers)) {
+                return false;
+            }
+            sectionCount = headers.FileHeader.NumberOfSections;
+            sizeOfOptionalHeader = headers.FileHeader.SizeOfOptionalHeader;
+            sizeOfImage = headers.OptionalHeader.SizeOfImage;
+        }
+
+        if (sectionCount == 0 || sectionCount > 96) {
+            return false;
+        }
+        if (sizeOfImage == 0) {
+            return false;
+        }
+        const std::size_t minimumOptionalSize =
+            pe64 ? sizeof(IMAGE_OPTIONAL_HEADER64)
+                 : sizeof(IMAGE_OPTIONAL_HEADER32);
+        if (sizeOfOptionalHeader < minimumOptionalSize) {
+            return false;
+        }
+        if (sizeOfImage > UINTPTR_MAX - imageBase_) {
+            return false;
+        }
+
+        if (sizeOfOptionalHeader > SIZE_MAX - optionalAddress) {
+            return false;
+        }
+        const std::size_t sectionTableOffset =
+            optionalAddress + sizeOfOptionalHeader;
+        const std::size_t sectionTableSize =
+            sizeof(IMAGE_SECTION_HEADER) * sectionCount;
+        if (sectionTableSize / sizeof(IMAGE_SECTION_HEADER) != sectionCount) {
+            return false;
+        }
+        if (sectionTableOffset > sizeOfImage ||
+            sectionTableSize > sizeOfImage - sectionTableOffset) {
+            return false;
+        }
+
+        std::size_t remaining = byteBudget;
+        std::vector<std::uint8_t> buffer;
+        for (DWORD index = 0; index < sectionCount; ++index) {
+            IMAGE_SECTION_HEADER section = {};
+            const auto sectionAddress =
+                reinterpret_cast<const std::uint8_t*>(imageBase_ +
+                                                      sectionTableOffset +
+                                                      index *
+                                                          sizeof(section));
+            if (!ReadRemote(sectionAddress, sizeof(section), &section)) {
+                return false;
+            }
+
+            const DWORD regionStart = section.VirtualAddress;
+            const DWORD regionSize = section.Misc.VirtualSize != 0
+                                         ? section.Misc.VirtualSize
+                                         : section.SizeOfRawData;
+            if (regionSize == 0 || regionStart >= sizeOfImage ||
+                regionSize > sizeOfImage - regionStart) {
+                continue;
+            }
+
+            const std::size_t available =
+                remaining < regionSize ? remaining : regionSize;
+            if (available < pattern.size()) {
+                continue;
+            }
+
+            buffer.resize(available);
+            if (!ReadRemote(base + regionStart, available, buffer.data())) {
+                // A partially unreadable section is skipped, not fatal.
+                continue;
+            }
+            remaining -= available;
+
+            for (std::size_t offset = 0;
+                 offset + pattern.size() <= available; ++offset) {
+                if (detail::MatchesAt(buffer.data() + offset, pattern)) {
+                    *match = const_cast<std::uint8_t*>(base + regionStart +
+                                                       offset);
+                    return true;
+                }
+            }
+            if (remaining < pattern.size()) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+private:
+    bool ReadRemote(const void* address, std::size_t size, void* buffer) const {
+        if (address == nullptr || buffer == nullptr || size == 0) {
+            return false;
+        }
+        SIZE_T read = 0;
+        const BOOL result = ReadProcessMemory(process_, address, buffer, size,
+                                              &read);
+        return result != FALSE && read == size;
+    }
+
+    HANDLE process_ = nullptr;
+    std::uintptr_t imageBase_ = 0;
+};
+
+}  // namespace yoko
+
+// Header-only Win32 ownership and validation helpers.
+//
+// This file is inlined by tools/bundle.py, so it must stay self-contained and
+// must never include another repository header.
+
+#include <windows.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+namespace yoko::win32 {
+
+inline constexpr float kMinimumDpiScale = 0.5f;
+inline constexpr float kMaximumDpiScale = 4.0f;
+inline constexpr UINT kDefaultDpi = 96;
+
+// Owns a kernel handle and closes it exactly once.
+class UniqueHandle {
+public:
+    UniqueHandle() = default;
+
+    explicit UniqueHandle(HANDLE handle) : handle_(handle) {}
+
+    ~UniqueHandle() { reset(); }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    UniqueHandle(UniqueHandle&& other) noexcept : handle_(other.release()) {}
+
+    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    HANDLE get() const { return handle_; }
+
+    bool valid() const {
+        return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE release() {
+        const HANDLE handle = handle_;
+        handle_ = nullptr;
+        return handle;
+    }
+
+    void reset(HANDLE handle = nullptr) {
+        if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+        }
+        handle_ = handle;
+    }
+
+private:
+    HANDLE handle_ = nullptr;
+};
+
+// Owns a GDI object and deletes it exactly once.
+class UniqueGdiObject {
+public:
+    UniqueGdiObject() = default;
+
+    explicit UniqueGdiObject(HGDIOBJ object) : object_(object) {}
+
+    ~UniqueGdiObject() { reset(); }
+
+    UniqueGdiObject(const UniqueGdiObject&) = delete;
+    UniqueGdiObject& operator=(const UniqueGdiObject&) = delete;
+
+    UniqueGdiObject(UniqueGdiObject&& other) noexcept
+        : object_(other.release()) {}
+
+    UniqueGdiObject& operator=(UniqueGdiObject&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    HGDIOBJ get() const { return object_; }
+
+    bool valid() const { return object_ != nullptr; }
+
+    HGDIOBJ release() {
+        const HGDIOBJ object = object_;
+        object_ = nullptr;
+        return object;
+    }
+
+    void reset(HGDIOBJ object = nullptr) {
+        if (object_ != nullptr) {
+            DeleteObject(object_);
+        }
+        object_ = object;
+    }
+
+private:
+    HGDIOBJ object_ = nullptr;
+};
+
+// A CURSORINFO that is zero-initialized with the required cbSize.
+struct UniqueCursorInfo {
+    CURSORINFO value{};
+
+    UniqueCursorInfo() { value.cbSize = sizeof(value); }
+
+    bool query() { return GetCursorInfo(&value) != FALSE; }
+
+    bool visible() const {
+        return (value.flags & CURSOR_SHOWING) != 0 && value.hCursor != nullptr;
+    }
+};
+
+// A window handle is only usable while the window still exists.
+inline bool IsValidWindow(HWND window) {
+    return window != nullptr && IsWindow(window) != FALSE;
+}
+
+// Converts a monitor DPI to a clamped scale factor. 96 DPI maps to 1.0.
+inline float DpiScaleForDpi(UINT dpi) {
+    const UINT effectiveDpi = dpi == 0 ? kDefaultDpi : dpi;
+    const float scale = static_cast<float>(effectiveDpi) /
+                        static_cast<float>(kDefaultDpi);
+    if (scale < kMinimumDpiScale) {
+        return kMinimumDpiScale;
+    }
+    if (scale > kMaximumDpiScale) {
+        return kMaximumDpiScale;
+    }
+    return scale;
+}
+
+// Reads bytes from this process through the documented API instead of
+// dereferencing a pointer that may not be mapped.
+inline bool TryReadSelf(const void* address, std::size_t size, void* buffer) {
+    if (address == nullptr || buffer == nullptr || size == 0) {
+        return false;
+    }
+    SIZE_T read = 0;
+    const BOOL result = ReadProcessMemory(GetCurrentProcess(), address, buffer,
+                                          size, &read);
+    return result != FALSE && read == size;
+}
+
+// True when the whole range is committed and readable in this process.
+inline bool IsReadableRange(const void* address, std::size_t size) {
+    if (address == nullptr || size == 0) {
+        return false;
+    }
+    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(address);
+    if (size > UINTPTR_MAX - start) {
+        return false;
+    }
+    const std::uintptr_t end = start + size;
+    std::uintptr_t current = start;
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION info = {};
+        if (VirtualQuery(reinterpret_cast<const void*>(current), &info,
+                         sizeof(info)) != sizeof(info)) {
+            return false;
+        }
+        if (info.State != MEM_COMMIT) {
+            return false;
+        }
+        if ((info.Protect & PAGE_GUARD) != 0 ||
+            (info.Protect & PAGE_NOACCESS) != 0) {
+            return false;
+        }
+        const std::uintptr_t regionStart =
+            reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        if (info.RegionSize > UINTPTR_MAX - regionStart) {
+            return false;
+        }
+        const std::uintptr_t regionEnd = regionStart + info.RegionSize;
+        if (regionEnd <= current) {
+            return false;
+        }
+        current = regionEnd;
+    }
+    return true;
+}
+
+// Resolves the entry point of a loaded module after validating the PE
+// headers. Returns false for any truncated or inconsistent image.
+inline bool FindModuleEntryPoint(HMODULE module, void** entryPoint) {
+    if (entryPoint == nullptr) {
+        return false;
+    }
+    *entryPoint = nullptr;
+    if (module == nullptr) {
+        return false;
+    }
+
+    const BYTE* const base = reinterpret_cast<const BYTE*>(module);
+
+    IMAGE_DOS_HEADER dosHeader = {};
+    if (!TryReadSelf(base, sizeof(dosHeader), &dosHeader)) {
+        return false;
+    }
+    if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew <= 0) {
+        return false;
+    }
+
+    const std::uintptr_t baseValue = reinterpret_cast<std::uintptr_t>(base);
+    const std::uintptr_t ntOffset = static_cast<std::uintptr_t>(
+        static_cast<DWORD>(dosHeader.e_lfanew));
+    if (ntOffset > UINTPTR_MAX - baseValue) {
+        return false;
+    }
+    const std::uintptr_t ntAddress = baseValue + ntOffset;
+    const BYTE* const ntBase = reinterpret_cast<const BYTE*>(ntAddress);
+
+    DWORD signature = 0;
+    if (!TryReadSelf(ntBase, sizeof(signature), &signature)) {
+        return false;
+    }
+    if (signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+
+    constexpr std::uintptr_t kOptionalHeaderOffset =
+        offsetof(IMAGE_NT_HEADERS32, OptionalHeader);
+    if (kOptionalHeaderOffset > UINTPTR_MAX - ntAddress) {
+        return false;
+    }
+    const std::uintptr_t optionalAddress = ntAddress + kOptionalHeaderOffset;
+    const BYTE* const optionalBase =
+        reinterpret_cast<const BYTE*>(optionalAddress);
+    WORD optionalMagic = 0;
+    if (!TryReadSelf(optionalBase, sizeof(optionalMagic), &optionalMagic)) {
+        return false;
+    }
+
+    DWORD sizeOfImage = 0;
+    DWORD addressOfEntryPoint = 0;
+    if (optionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        IMAGE_NT_HEADERS64 headers = {};
+        if (!TryReadSelf(ntBase, sizeof(headers), &headers)) {
+            return false;
+        }
+        sizeOfImage = headers.OptionalHeader.SizeOfImage;
+        addressOfEntryPoint = headers.OptionalHeader.AddressOfEntryPoint;
+    } else if (optionalMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        IMAGE_NT_HEADERS32 headers = {};
+        if (!TryReadSelf(ntBase, sizeof(headers), &headers)) {
+            return false;
+        }
+        sizeOfImage = headers.OptionalHeader.SizeOfImage;
+        addressOfEntryPoint = headers.OptionalHeader.AddressOfEntryPoint;
+    } else {
+        return false;
+    }
+
+    if (addressOfEntryPoint == 0 || addressOfEntryPoint >= sizeOfImage) {
+        return false;
+    }
+
+    if (addressOfEntryPoint > UINTPTR_MAX - baseValue) {
+        return false;
+    }
+    const BYTE* const entry =
+        reinterpret_cast<const BYTE*>(baseValue + addressOfEntryPoint);
+    if (!IsReadableRange(entry, 1)) {
+        return false;
+    }
+    *entryPoint = const_cast<BYTE*>(entry);
+    return true;
+}
+
+}  // namespace yoko::win32
+
+// Compile-time tuning values shared by the trail, ripple and ornament code.
+
 
 constexpr UINT kSettingsChangedMessage = WM_APP + 1;
 constexpr int kTargetFrameRate = 125;
@@ -545,6 +1201,9 @@ constexpr float kOrnamentMinDrawOpacity = 0.004f;
 constexpr float kOrnamentPi = 3.14159265f;
 constexpr float kOrnamentDefaultClickImpulse = 240.0f;
 constexpr float kOrnamentDefaultWheelImpulse = 200.0f;
+
+// Plain data types used by the renderer, the caches and the settings layer.
+
 
 // The preset table below is ordered to match this enum, so a preset key
 // resolves to its definition by index.
@@ -676,162 +1335,6 @@ constexpr OrnamentPresetDefinition kOrnamentPresets[] = {
         },
     },
 };
-
-std::atomic<HWND> g_overlayHwnd{nullptr};
-HANDLE g_threadHandle = nullptr;
-HANDLE g_stopEvent = nullptr;
-HANDLE g_inputWakeEvent = nullptr;
-std::atomic_bool g_settingsDirty{false};
-bool g_interactionPending = false;
-bool g_rawInputRegistered = false;
-bool g_rawInputWakePending = false;
-bool g_rawMouseMovementPending = false;
-bool g_foregroundChangePending = false;
-bool g_elevatedForeground = false;
-bool g_pollingFallback = true;
-bool g_currentIntegrityLevelAttempted = false;
-bool g_currentIntegrityLevelKnown = false;
-DWORD g_currentIntegrityLevelRid = SECURITY_MANDATORY_MEDIUM_RID;
-POINT g_fallbackCursorPosition = {};
-DWORD g_fallbackLastMovementTick = 0;
-bool g_fallbackCursorPositionValid = false;
-LONGLONG g_nextSampleDeadline = 0;
-LONGLONG g_lastRawInputWakeQpc = 0;
-HWINEVENTHOOK g_foregroundEventHook = nullptr;
-
-POINT g_history[kHistoryCapacity] = {};
-int g_historyHead = 0;
-int g_historyCount = 0;
-POINT g_lastPos = {0, 0};
-LONGLONG g_lastSampleQpc = 0;
-LONGLONG g_qpcFrequency = 0;
-bool g_isSmearing = false;
-int g_lowVelocityFrames = 0;
-float g_fadeAlpha = 0.0f;
-POINT g_lastMotionCuePoint = {};
-LONGLONG g_lastMotionCueQpc = 0;
-float g_lastMotionCueSpeed = 0.0f;
-POINT g_accelerationWindowPoint = {};
-LONGLONG g_accelerationWindowQpc = 0;
-float g_accelerationWindowSpeed = 0.0f;
-bool g_hasAccelerationWindowSample = false;
-bool g_hasAccelerationWindowSpeed = false;
-float g_lastMotionDirectionX = 0.0f;
-float g_lastMotionDirectionY = 0.0f;
-bool g_hasPreviousMotionCueSample = false;
-LONGLONG g_lastAccelerationAccentQpc = 0;
-LONGLONG g_lastTurnAccentQpc = 0;
-float g_smoothedSpeedNorm = 0.0f;
-float g_frozenSpeedNorm = 0.5f;
-bool g_windowVisible = false;
-
-ID2D1Factory* g_d2dFactory = nullptr;
-ID2D1DCRenderTarget* g_renderTarget = nullptr;
-ID2D1Layer* g_trailOpacityLayer = nullptr;
-ID2D1Layer* g_glowOpacityLayer = nullptr;
-ID2D1SolidColorBrush* g_outerBrush = nullptr;
-ID2D1SolidColorBrush* g_coreBrush = nullptr;
-ID2D1SolidColorBrush* g_glowBrush = nullptr;
-ID2D1SolidColorBrush* g_rippleBrush = nullptr;
-ID2D1LinearGradientBrush* g_gradientBrush = nullptr;
-ID2D1GradientStopCollection* g_gradientStops = nullptr;
-ID2D1StrokeStyle* g_strokeStyle = nullptr;
-uint32_t g_gradientHeadCache = 0xFFFFFFFFu;
-uint32_t g_gradientTailCache = 0xFFFFFFFFu;
-uint32_t g_outerBrushColorCache = 0xFFFFFFFFu;
-uint32_t g_coreBrushColorCache = 0xFFFFFFFFu;
-uint32_t g_glowBrushColorCache = 0xFFFFFFFFu;
-bool g_dcBound = false;
-HDC g_backBufferDc = nullptr;
-HBITMAP g_backBufferBitmap = nullptr;
-HGDIOBJ g_originalBitmap = nullptr;
-int g_cachedWidth = 0;
-int g_cachedHeight = 0;
-DWORD g_backbufferIdleSince = 0;
-HDC g_screenDc = nullptr;
-
-float g_triggerVelocity = 3000.0f;
-float g_stopVelocity = 1200.0f;
-int g_tailOffsetX = 6;
-int g_tailOffsetY = 10;
-int g_tailLength = 10;
-int g_speedScaling = 1;
-float g_widthMin = 4.0f;
-float g_widthMax = 14.0f;
-float g_coreWidthMin = 2.0f;
-float g_coreWidthMax = 9.0f;
-float g_alphaMin = 0.39f;
-float g_alphaMax = 0.77f;
-int g_taperPowerIndex = 10;
-int g_smoothIterations = 2;
-int g_gradientEnabled = 0;
-uint32_t g_gradientTailRGB = 0x00FF00FF;
-int g_glowEnabled = 0;
-uint32_t g_glowRGB = 0x00FFFFFF;
-float g_glowWidthFactor = 1.8f;
-float g_glowAlpha = 0.25f;
-int g_fadeEnabled = 1;
-float g_fadeDecay = 0.90f;
-int g_trailColorMode = 0;
-uint32_t g_manualColorRGB = 0x00FFFFFF;
-int g_outlineColorMode = 0;
-uint32_t g_manualOutlineRGB = 0x00000000;
-int g_autoResampleInterval = 0;
-uint32_t g_currentCoreRGB = kFallbackCoreColor;
-uint32_t g_currentOuterRGB = kFallbackOuterColor;
-float g_currentCoreLuminance = kFallbackCoreLuminance;
-DWORD g_lastAutoColorUpdate = 0;
-HCURSOR g_lastAutoColorCursor = nullptr;
-bool g_autoColorInitialized = false;
-float g_lastAutoColorPickLuminance = 0.5f;
-bool g_autoColorPickLuminanceValid = false;
-
-HMONITOR g_cursorMonitor = nullptr;
-UINT g_cursorDpi = 96;
-float g_currentDpiScale = 1.0f;
-
-int g_clickFeedbackEnabled = 0;
-int g_wheelFeedbackEnabled = 0;
-uint32_t g_leftClickRGB = 0x0000D7FF;
-uint32_t g_rightClickRGB = 0x00FF4C8B;
-uint32_t g_middleClickRGB = 0x00FFD166;
-uint32_t g_wheelUpRGB = 0x007CFF6B;
-uint32_t g_wheelDownRGB = 0x00A78BFA;
-float g_rippleRadius = 36.0f;
-float g_wheelArrowSize = 18.0f;
-float g_wheelArrowDistance = 32.0f;
-int g_rippleDurationMs = 420;
-float g_rippleStrokeWidth = 3.0f;
-float g_rippleOpacity = 0.78f;
-int g_accelerationAccentEnabled = 1;
-int g_turnAccentEnabled = 0;
-int g_fastMoveInterpolationEnabled = 1;
-int g_accelerationThreshold = 30000;
-int g_turnAngleDegrees = 65;
-float g_turnAccentCosThreshold = 0.42261826f;  // cos(65 degrees)
-int g_motionAccentDurationMs = 300;
-float g_motionAccentSize = 22.0f;
-float g_motionAccentOpacity = 0.90f;
-int g_maxInterpolationSteps = 4;
-uint32_t g_motionAccentRGB = 0x00FFD166;
-
-int g_ornamentEnabled = 0;
-float g_ornamentAnchorOffsetX = 10.0f;
-float g_ornamentAnchorOffsetY = 12.0f;
-float g_ornamentGravity = 1400.0f;
-float g_ornamentDamping = 8.0f;
-int g_ornamentConstraintIterations = 4;
-float g_ornamentStretch = 0.18f;
-float g_ornamentOpacity = 1.0f;
-float g_ornamentClickImpulse = kOrnamentDefaultClickImpulse;
-float g_ornamentWheelImpulse = kOrnamentDefaultWheelImpulse;
-int g_ornamentRopeSegments = 8;
-float g_ornamentRopeLengthPx = kOrnamentDefaultRopeLengthPx;
-float g_ornamentRopeLengthScale = 1.0f;
-OrnamentRopeStyle g_ornamentRopeStyle = OrnamentRopeStyle::Silk;
-float g_ornamentRopeWidthPx = 1.5f;
-float g_ornamentRopeOpacity = 0.8f;
-
 struct OrnamentImageSpec {
     std::wstring id;
     std::wstring path;
@@ -872,32 +1375,6 @@ struct OrnamentNode {
     float scaleX = 1.0f;
     float scaleY = 1.0f;
 };
-
-std::vector<OrnamentImageSpec> g_ornamentImageSpecs;
-std::vector<OrnamentNodeSpec> g_ornamentNodeSpecs;
-std::vector<OrnamentImage> g_ornamentImages;
-std::vector<OrnamentNode> g_ornamentNodes;
-// Set once every image in g_ornamentImages holds a device bitmap or has
-// latched a failure, so visible frames skip the whole upload scan.
-bool g_ornamentBitmapsSettled = false;
-D2D1_POINT_2F g_ornamentRopePoints[kOrnamentMaxRopePoints] = {};
-D2D1_POINT_2F g_ornamentRopePrevious[kOrnamentMaxRopePoints] = {};
-D2D1_POINT_2F g_ornamentRopeSmoothA[kOrnamentMaxRopeDrawPoints] = {};
-D2D1_POINT_2F g_ornamentRopeSmoothB[kOrnamentMaxRopeDrawPoints] = {};
-int g_ornamentRopePointCount = 0;
-float g_ornamentRopeSegmentPx = 0.0f;
-std::atomic_bool g_ornamentAssetsDirty{false};
-bool g_ornamentAssetsReady = false;
-bool g_ornamentPhysicsInitialized = false;
-bool g_ornamentRedrawPending = false;
-LONGLONG g_ornamentLastStepQpc = 0;
-LONGLONG g_ornamentNextRenderQpc = 0;
-D2D1_POINT_2F g_ornamentLastAnchor = {};
-float g_ornamentSmoothedSpeedNorm = 0.0f;
-float g_ornamentSmoothedSpeedPx = 0.0f;
-IWICImagingFactory* g_wicFactory = nullptr;
-ID2D1SolidColorBrush* g_ornamentBrush = nullptr;
-
 enum class RippleKind : uint8_t {
     Click,
     WheelUp,
@@ -930,46 +1407,7 @@ struct MotionAccent {
     MotionAccentKind kind = MotionAccentKind::Acceleration;
     bool active = false;
 };
-
-RippleEffect g_ripples[kMaxActiveRipples] = {};
-int g_nextRippleSlot = 0;
-MotionAccent g_motionAccents[kMaxActiveMotionAccents] = {};
-int g_nextMotionAccentSlot = 0;
-
 struct AppRule { std::wstring exe; bool enabled; };
-std::vector<AppRule> g_appRules;
-HWND g_cachedForegroundWindow = nullptr;
-int g_cachedAppRule = 0;
-
-bool g_fullscreenSuppressed = false;
-DWORD g_fullscreenFalseSince = 0;
-HWND g_fullscreenForegroundWindow = nullptr;
-DWORD g_lastFullscreenStrongCheck = 0;
-bool g_fullscreenStrongSignal = false;
-bool g_fullscreenCoversMonitor = false;
-
-// The settings expose exponent values from 0.5 through 3.0 in 0.1 steps.
-// Filling the table once removes powf from every taper rebuild; interpolating
-// between the 257 samples keeps the curve visually identical.
-float g_taperLut[kTaperPowerCount][kTaperLutSteps + 1] = {};
-bool g_taperLutReady = false;
-
-static void EnsureTaperLut() {
-    if (g_taperLutReady) return;
-    for (int powerIndex = 0; powerIndex < kTaperPowerCount; ++powerIndex) {
-        const float power =
-            static_cast<float>(kTaperPowerSettingMin + powerIndex) / 10.0f;
-        float* row = g_taperLut[powerIndex];
-        for (int i = 0; i < kTaperLutSteps; ++i) {
-            const float ratio =
-                static_cast<float>(i) / static_cast<float>(kTaperLutSteps);
-            row[i] = powf(1.0f - ratio, power);
-        }
-        row[kTaperLutSteps] = 0.0f;
-    }
-    g_taperLutReady = true;
-}
-
 struct TrailRenderCache {
     D2D1_POINT_2F pointsA[kMaxTrailRenderPoints] = {};
     D2D1_POINT_2F pointsB[kMaxTrailRenderPoints] = {};
@@ -981,62 +1419,316 @@ struct TrailRenderCache {
     int cachedTaperPowerIndex = -1;
     bool taperCacheValid = false;
 
-    void PrepareTaper() {
-        if (pointCount <= 1) return;
-        if (taperCacheValid &&
-            cachedTaperPointCount == pointCount &&
-            cachedTaperPowerIndex == g_taperPowerIndex) {
-            return;
-        }
-
-        EnsureTaperLut();
-        const int lutPower = std::clamp(
-            g_taperPowerIndex - kTaperPowerSettingMin,
-            0,
-            kTaperPowerCount - 1);
-        const float* row = g_taperLut[lutPower];
-        const float scale =
-            static_cast<float>(kTaperLutSteps) /
-            static_cast<float>(pointCount - 1);
-        for (int i = 0; i + 1 < pointCount; ++i) {
-            const float position = static_cast<float>(i) * scale;
-            const int lutIndex = static_cast<int>(position);
-            const float fraction = position - static_cast<float>(lutIndex);
-            const float low = row[lutIndex];
-            const float high = row[lutIndex + 1];
-            taper[i] = low + (high - low) * fraction;
-        }
-        taper[pointCount - 1] = 0.0f;
-
-        cachedTaperPointCount = pointCount;
-        cachedTaperPowerIndex = g_taperPowerIndex;
-        taperCacheValid = true;
-    }
+    void PrepareTaper();
 };
-TrailRenderCache g_renderCache;
+// The ribbon submits one closed outline per layer: side one, a round tail cap,
+// then side two. The head stays a separate ellipse, which keeps the original
+// rounded head exactly. A single fill replaces a stroke per trail segment, and
+// the winding fill mode keeps self-crossing trails filled as one shape.
+// A reversing turn folds the outline instead of reaching the round tip of the
+// stroke join it replaced, so those interior centers get a disk of at most the
+// local half width after the fill.
+//
+// Center decimation, taper sampling, and normals depend only on the smoothed
+// trail, so they are computed once per generation and shared by all layers.
+// Only the half width scaling and the outline points vary per layer.
+struct TrailRibbonCache {
+    D2D1_POINT_2F centers[kTrailRibbonMaxCenterPoints] = {};
+    float normalX[kTrailRibbonMaxCenterPoints] = {};
+    float normalY[kTrailRibbonMaxCenterPoints] = {};
+    float taper[kTrailRibbonMaxCenterPoints] = {};
+    bool roundJoin[kTrailRibbonMaxCenterPoints] = {};
+    int centerCount = 0;
+    int generation = 0;
+    bool valid = false;
+};
+struct ColorCandidate {
+    uint32_t rgb;
+    int count;
+    float luminance;
+};
 
-// sRGB channel values converted to linear light once. Luminance is evaluated
-// for sampled screen pixels and every cursor color candidate, so a fixed table
-// replaces a powf call on each of the three channels.
-float g_srgbToLinear[256] = {};
-bool g_srgbLutReady = false;
+// The single ModContext instance that owns every mutable value.
+
+
+struct ModContext {
+
+    // Thread, sampling, and input wake state.
+    std::atomic<HWND> overlayHwnd{nullptr};
+    HANDLE threadHandle = nullptr;
+    HANDLE stopEvent = nullptr;
+    HANDLE inputWakeEvent = nullptr;
+    std::atomic_bool settingsDirty{false};
+    bool interactionPending = false;
+    bool rawInputRegistered = false;
+    bool rawInputWakePending = false;
+    bool rawMouseMovementPending = false;
+    bool foregroundChangePending = false;
+    bool elevatedForeground = false;
+    bool pollingFallback = true;
+    bool currentIntegrityLevelAttempted = false;
+    bool currentIntegrityLevelKnown = false;
+    DWORD currentIntegrityLevelRid = SECURITY_MANDATORY_MEDIUM_RID;
+    POINT fallbackCursorPosition = {};
+    DWORD fallbackLastMovementTick = 0;
+    bool fallbackCursorPositionValid = false;
+    LONGLONG nextSampleDeadline = 0;
+    LONGLONG lastRawInputWakeQpc = 0;
+    HWINEVENTHOOK foregroundEventHook = nullptr;
+
+    POINT history[kHistoryCapacity] = {};
+    int historyHead = 0;
+    int historyCount = 0;
+    POINT lastPos = {0, 0};
+    LONGLONG lastSampleQpc = 0;
+    LONGLONG qpcFrequency = 0;
+    bool isSmearing = false;
+    int lowVelocityFrames = 0;
+    float fadeAlpha = 0.0f;
+    POINT lastMotionCuePoint = {};
+    LONGLONG lastMotionCueQpc = 0;
+    float lastMotionCueSpeed = 0.0f;
+    POINT accelerationWindowPoint = {};
+    LONGLONG accelerationWindowQpc = 0;
+    float accelerationWindowSpeed = 0.0f;
+    bool hasAccelerationWindowSample = false;
+    bool hasAccelerationWindowSpeed = false;
+    float lastMotionDirectionX = 0.0f;
+    float lastMotionDirectionY = 0.0f;
+    bool hasPreviousMotionCueSample = false;
+    LONGLONG lastAccelerationAccentQpc = 0;
+    LONGLONG lastTurnAccentQpc = 0;
+    float smoothedSpeedNorm = 0.0f;
+    float frozenSpeedNorm = 0.5f;
+    bool windowVisible = false;
+
+    ID2D1Factory* d2dFactory = nullptr;
+    ID2D1DCRenderTarget* renderTarget = nullptr;
+    ID2D1Layer* trailOpacityLayer = nullptr;
+    ID2D1Layer* glowOpacityLayer = nullptr;
+    ID2D1SolidColorBrush* outerBrush = nullptr;
+    ID2D1SolidColorBrush* coreBrush = nullptr;
+    ID2D1SolidColorBrush* glowBrush = nullptr;
+    ID2D1SolidColorBrush* rippleBrush = nullptr;
+    ID2D1LinearGradientBrush* gradientBrush = nullptr;
+    ID2D1GradientStopCollection* gradientStops = nullptr;
+    ID2D1StrokeStyle* strokeStyle = nullptr;
+    uint32_t gradientHeadCache = 0xFFFFFFFFu;
+    uint32_t gradientTailCache = 0xFFFFFFFFu;
+    uint32_t outerBrushColorCache = 0xFFFFFFFFu;
+    uint32_t coreBrushColorCache = 0xFFFFFFFFu;
+    uint32_t glowBrushColorCache = 0xFFFFFFFFu;
+    bool dcBound = false;
+    HDC backBufferDc = nullptr;
+    HBITMAP backBufferBitmap = nullptr;
+    HGDIOBJ originalBitmap = nullptr;
+    int cachedWidth = 0;
+    int cachedHeight = 0;
+    DWORD backbufferIdleSince = 0;
+    HDC screenDc = nullptr;
+
+    float triggerVelocity = 3000.0f;
+    float stopVelocity = 1200.0f;
+    int tailOffsetX = 6;
+    int tailOffsetY = 10;
+    int tailLength = 10;
+    int speedScaling = 1;
+    float widthMin = 4.0f;
+    float widthMax = 14.0f;
+    float coreWidthMin = 2.0f;
+    float coreWidthMax = 9.0f;
+    float alphaMin = 0.39f;
+    float alphaMax = 0.77f;
+    int taperPowerIndex = 10;
+    int smoothIterations = 2;
+    int gradientEnabled = 0;
+    uint32_t gradientTailRGB = 0x00FF00FF;
+    int glowEnabled = 0;
+    uint32_t glowRGB = 0x00FFFFFF;
+    float glowWidthFactor = 1.8f;
+    float glowAlpha = 0.25f;
+    int fadeEnabled = 1;
+    float fadeDecay = 0.90f;
+    int trailColorMode = 0;
+    uint32_t manualColorRGB = 0x00FFFFFF;
+    int outlineColorMode = 0;
+    uint32_t manualOutlineRGB = 0x00000000;
+    int autoResampleInterval = 0;
+    uint32_t currentCoreRGB = kFallbackCoreColor;
+    uint32_t currentOuterRGB = kFallbackOuterColor;
+    float currentCoreLuminance = kFallbackCoreLuminance;
+    DWORD lastAutoColorUpdate = 0;
+    HCURSOR lastAutoColorCursor = nullptr;
+    bool autoColorInitialized = false;
+    float lastAutoColorPickLuminance = 0.5f;
+    bool autoColorPickLuminanceValid = false;
+
+    HMONITOR cursorMonitor = nullptr;
+    UINT cursorDpi = 96;
+    float currentDpiScale = 1.0f;
+
+    int clickFeedbackEnabled = 0;
+    int wheelFeedbackEnabled = 0;
+    uint32_t leftClickRGB = 0x0000D7FF;
+    uint32_t rightClickRGB = 0x00FF4C8B;
+    uint32_t middleClickRGB = 0x00FFD166;
+    uint32_t wheelUpRGB = 0x007CFF6B;
+    uint32_t wheelDownRGB = 0x00A78BFA;
+    float rippleRadius = 36.0f;
+    float wheelArrowSize = 18.0f;
+    float wheelArrowDistance = 32.0f;
+    int rippleDurationMs = 420;
+    float rippleStrokeWidth = 3.0f;
+    float rippleOpacity = 0.78f;
+    int accelerationAccentEnabled = 1;
+    int turnAccentEnabled = 0;
+    int fastMoveInterpolationEnabled = 1;
+    int accelerationThreshold = 30000;
+    int turnAngleDegrees = 65;
+    float turnAccentCosThreshold = 0.42261826f;  // cos(65 degrees)
+    int motionAccentDurationMs = 300;
+    float motionAccentSize = 22.0f;
+    float motionAccentOpacity = 0.90f;
+    int maxInterpolationSteps = 4;
+    uint32_t motionAccentRGB = 0x00FFD166;
+
+    int ornamentEnabled = 0;
+    float ornamentAnchorOffsetX = 10.0f;
+    float ornamentAnchorOffsetY = 12.0f;
+    float ornamentGravity = 1400.0f;
+    float ornamentDamping = 8.0f;
+    int ornamentConstraintIterations = 4;
+    float ornamentStretch = 0.18f;
+    float ornamentOpacity = 1.0f;
+    float ornamentClickImpulse = kOrnamentDefaultClickImpulse;
+    float ornamentWheelImpulse = kOrnamentDefaultWheelImpulse;
+    int ornamentRopeSegments = 8;
+    float ornamentRopeLengthPx = kOrnamentDefaultRopeLengthPx;
+    float ornamentRopeLengthScale = 1.0f;
+    OrnamentRopeStyle ornamentRopeStyle = OrnamentRopeStyle::Silk;
+    float ornamentRopeWidthPx = 1.5f;
+    float ornamentRopeOpacity = 0.8f;
+
+    // Ornament assets and simulation state.
+    std::vector<OrnamentImageSpec> ornamentImageSpecs;
+    std::vector<OrnamentNodeSpec> ornamentNodeSpecs;
+    std::vector<OrnamentImage> ornamentImages;
+    std::vector<OrnamentNode> ornamentNodes;
+    // Set once every image in ornamentImages holds a device bitmap or has
+    // latched a failure, so visible frames skip the whole upload scan.
+    bool ornamentBitmapsSettled = false;
+    D2D1_POINT_2F ornamentRopePoints[kOrnamentMaxRopePoints] = {};
+    D2D1_POINT_2F ornamentRopePrevious[kOrnamentMaxRopePoints] = {};
+    D2D1_POINT_2F ornamentRopeSmoothA[kOrnamentMaxRopeDrawPoints] = {};
+    D2D1_POINT_2F ornamentRopeSmoothB[kOrnamentMaxRopeDrawPoints] = {};
+    int ornamentRopePointCount = 0;
+    float ornamentRopeSegmentPx = 0.0f;
+    std::atomic_bool ornamentAssetsDirty{false};
+    bool ornamentAssetsReady = false;
+    bool ornamentPhysicsInitialized = false;
+    bool ornamentRedrawPending = false;
+    LONGLONG ornamentLastStepQpc = 0;
+    LONGLONG ornamentNextRenderQpc = 0;
+    D2D1_POINT_2F ornamentLastAnchor = {};
+    float ornamentSmoothedSpeedNorm = 0.0f;
+    float ornamentSmoothedSpeedPx = 0.0f;
+    IWICImagingFactory* wicFactory = nullptr;
+    ID2D1SolidColorBrush* ornamentBrush = nullptr;
+
+    // Interaction effects.
+    RippleEffect ripples[kMaxActiveRipples] = {};
+    int nextRippleSlot = 0;
+    MotionAccent motionAccents[kMaxActiveMotionAccents] = {};
+    int nextMotionAccentSlot = 0;
+
+    // Application rules and fullscreen suppression.
+    std::vector<AppRule> appRules;
+    HWND cachedForegroundWindow = nullptr;
+    int cachedAppRule = 0;
+
+    bool fullscreenSuppressed = false;
+    DWORD fullscreenFalseSince = 0;
+    HWND fullscreenForegroundWindow = nullptr;
+    DWORD lastFullscreenStrongCheck = 0;
+    bool fullscreenStrongSignal = false;
+    bool fullscreenCoversMonitor = false;
+
+    // Cubic taper lookup table.
+    // The settings expose exponent values from 0.5 through 3.0 in 0.1 steps.
+    // Filling the table once removes powf from every taper rebuild; interpolating
+    // between the 257 samples keeps the curve visually identical.
+    float taperLut[kTaperPowerCount][kTaperLutSteps + 1] = {};
+    bool taperLutReady = false;
+
+    // Trail render cache.
+    TrailRenderCache renderCache = {};
+
+    // sRGB to linear lookup table.
+    // sRGB channel values converted to linear light once. Luminance is evaluated
+    // for sampled screen pixels and every cursor color candidate, so a fixed table
+    // replaces a powf call on each of the three channels.
+    float srgbToLinear[256] = {};
+    bool srgbLutReady = false;
+
+    // Ribbon cache and outline scratch buffer.
+    TrailRibbonCache ribbonCache = {};
+    D2D1_POINT_2F ribbonOutline[kTrailRibbonMaxOutlinePoints] = {};
+
+    // Cursor color candidate cache.
+    HCURSOR cachedCursorCandidateHandle = nullptr;
+    std::vector<ColorCandidate> cachedCursorColorCandidates;
+    bool cachedCursorCandidatesReady = false;
+
+    // Background luminance sampling surface.
+    HDC backgroundSamplerDc = nullptr;
+    HBITMAP backgroundSamplerBitmap = nullptr;
+    HGDIOBJ backgroundSamplerOriginal = nullptr;
+    uint32_t* backgroundSamplerPixels = nullptr;
+    int backgroundSamplerSize = 0;
+    bool backgroundLuminanceValid = false;
+    POINT backgroundLuminanceCenter = {0, 0};
+    DWORD backgroundLuminanceUpdated = 0;
+    float backgroundLuminance = 0.5f;
+
+    // Tool mod launcher state.
+    bool isToolModProcessLauncher = false;
+    HANDLE toolModProcessMutex = nullptr;
+};
+
+// The only instance. All mutable mod state lives here.
+inline ModContext context;
+
+// Declarations for helpers that are called before their definition.
+
+
+static void SetTrailCoreColor(uint32_t core, float luminance);
+static void ReleaseOrnamentBitmaps();
+static void ClearRipples();
+static void ClearMotionAccents();
+static void ResetMotionCueTracking();
+static bool OrnamentActive();
+static void ResetAutoColorSamplingCache();
+static bool HasActiveRipples(LONGLONG nowQpc);
+
+// Colour conversion, luminance and colour parsing helpers.
+
 
 static void EnsureSrgbLut() {
-    if (g_srgbLutReady) return;
+    if (context.srgbLutReady) return;
     for (int i = 0; i < 256; ++i) {
         const float channel = static_cast<float>(i) / 255.0f;
-        g_srgbToLinear[i] = channel <= 0.03928f
+        context.srgbToLinear[i] = channel <= 0.03928f
             ? channel / 12.92f
             : powf((channel + 0.055f) / 1.055f, 2.4f);
     }
-    g_srgbLutReady = true;
+    context.srgbLutReady = true;
 }
 
 static inline float RgbLuminance(uint8_t r, uint8_t g, uint8_t b) {
-    if (!g_srgbLutReady) EnsureSrgbLut();
-    return 0.2126f * g_srgbToLinear[r]
-        + 0.7152f * g_srgbToLinear[g]
-        + 0.0722f * g_srgbToLinear[b];
+    if (!context.srgbLutReady) EnsureSrgbLut();
+    return 0.2126f * context.srgbToLinear[r]
+        + 0.7152f * context.srgbToLinear[g]
+        + 0.0722f * context.srgbToLinear[b];
 }
 
 static inline float RgbLuminance(uint32_t rgb) {
@@ -1104,41 +1796,90 @@ static LONGLONG QpcNow() {
     return value.QuadPart;
 }
 
-static void SetTrailCoreColor(uint32_t core, float luminance);
-static void ReleaseOrnamentBitmaps();
+// Overlay visibility transitions and capture affinity.
+
+
+void HideOverlay() {
+    const HWND hwnd = context.overlayHwnd.load();
+    if (!hwnd || !IsWindow(hwnd) || !context.windowVisible) return;
+    ShowWindow(hwnd, SW_HIDE);
+    context.windowVisible = false;
+}
+
+void ShowOverlay() {
+    const HWND hwnd = context.overlayHwnd.load();
+    if (!hwnd || !IsWindow(hwnd) || context.windowVisible) return;
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    context.windowVisible = true;
+}
+// The overlay only needs to be hidden from screen capture while Auto color mode
+// is sampling the screen background, otherwise the sample would pick up the
+// trail's own pixels. In Manual mode the overlay stays capturable so the trail
+// shows up in screenshots and screen shares.
+static void ApplyOverlayCaptureAffinity() {
+    const HWND hwnd = context.overlayHwnd.load(std::memory_order_acquire);
+    if (!hwnd || !IsWindow(hwnd)) return;
+    if (!SetWindowDisplayAffinity(hwnd, context.trailColorMode == 1 ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE)) {
+        Wh_Log(L"SetWindowDisplayAffinity failed: %lu", GetLastError());
+    }
+}
+
+// Cursor sample ring buffer and trail reset helpers.
+
+
+void HistoryClear() { context.historyHead = 0; context.historyCount = 0; }
+static void ResetTrailState() {
+    HistoryClear();
+    context.isSmearing = false;
+    context.lowVelocityFrames = 0;
+    context.fadeAlpha = 0.0f;
+}
+void HistoryPushFront(const POINT& point) {
+    if (context.historyCount == kHistoryCapacity) --context.historyCount;
+    context.historyHead = (context.historyHead - 1 + kHistoryCapacity) % kHistoryCapacity;
+    context.history[context.historyHead] = point;
+    ++context.historyCount;
+}
+
+void HistoryPopBack() { if (context.historyCount > 0) --context.historyCount; }
+
+const POINT& HistoryAt(int index) { return context.history[(context.historyHead + index) % kHistoryCapacity]; }
+
+// Render target, brush and screen DC lifetime helpers.
+
 
 void ReleaseRenderResources() {
     ReleaseOrnamentBitmaps();
-    if (g_ornamentBrush) { g_ornamentBrush->Release(); g_ornamentBrush = nullptr; }
-    if (g_glowOpacityLayer) { g_glowOpacityLayer->Release(); g_glowOpacityLayer = nullptr; }
-    if (g_trailOpacityLayer) { g_trailOpacityLayer->Release(); g_trailOpacityLayer = nullptr; }
-    if (g_gradientBrush) { g_gradientBrush->Release(); g_gradientBrush = nullptr; }
-    if (g_gradientStops) { g_gradientStops->Release(); g_gradientStops = nullptr; }
-    if (g_strokeStyle) { g_strokeStyle->Release(); g_strokeStyle = nullptr; }
-    if (g_rippleBrush) { g_rippleBrush->Release(); g_rippleBrush = nullptr; }
-    if (g_glowBrush) { g_glowBrush->Release(); g_glowBrush = nullptr; }
-    if (g_coreBrush) { g_coreBrush->Release(); g_coreBrush = nullptr; }
-    if (g_outerBrush) { g_outerBrush->Release(); g_outerBrush = nullptr; }
-    if (g_renderTarget) { g_renderTarget->Release(); g_renderTarget = nullptr; }
-    g_gradientHeadCache = 0xFFFFFFFFu;
-    g_gradientTailCache = 0xFFFFFFFFu;
-    g_outerBrushColorCache = 0xFFFFFFFFu;
-    g_coreBrushColorCache = 0xFFFFFFFFu;
-    g_glowBrushColorCache = 0xFFFFFFFFu;
-    g_dcBound = false;
+    if (context.ornamentBrush) { context.ornamentBrush->Release(); context.ornamentBrush = nullptr; }
+    if (context.glowOpacityLayer) { context.glowOpacityLayer->Release(); context.glowOpacityLayer = nullptr; }
+    if (context.trailOpacityLayer) { context.trailOpacityLayer->Release(); context.trailOpacityLayer = nullptr; }
+    if (context.gradientBrush) { context.gradientBrush->Release(); context.gradientBrush = nullptr; }
+    if (context.gradientStops) { context.gradientStops->Release(); context.gradientStops = nullptr; }
+    if (context.strokeStyle) { context.strokeStyle->Release(); context.strokeStyle = nullptr; }
+    if (context.rippleBrush) { context.rippleBrush->Release(); context.rippleBrush = nullptr; }
+    if (context.glowBrush) { context.glowBrush->Release(); context.glowBrush = nullptr; }
+    if (context.coreBrush) { context.coreBrush->Release(); context.coreBrush = nullptr; }
+    if (context.outerBrush) { context.outerBrush->Release(); context.outerBrush = nullptr; }
+    if (context.renderTarget) { context.renderTarget->Release(); context.renderTarget = nullptr; }
+    context.gradientHeadCache = 0xFFFFFFFFu;
+    context.gradientTailCache = 0xFFFFFFFFu;
+    context.outerBrushColorCache = 0xFFFFFFFFu;
+    context.coreBrushColorCache = 0xFFFFFFFFu;
+    context.glowBrushColorCache = 0xFFFFFFFFu;
+    context.dcBound = false;
 }
 
 void ReleaseBackbuffer() {
     ReleaseRenderResources();
-    if (g_backBufferDc) {
-        if (g_originalBitmap) { SelectObject(g_backBufferDc, g_originalBitmap); g_originalBitmap = nullptr; }
-        DeleteDC(g_backBufferDc);
-        g_backBufferDc = nullptr;
+    if (context.backBufferDc) {
+        if (context.originalBitmap) { SelectObject(context.backBufferDc, context.originalBitmap); context.originalBitmap = nullptr; }
+        DeleteDC(context.backBufferDc);
+        context.backBufferDc = nullptr;
     }
-    if (g_backBufferBitmap) { DeleteObject(g_backBufferBitmap); g_backBufferBitmap = nullptr; }
-    g_cachedWidth = 0;
-    g_cachedHeight = 0;
-    g_backbufferIdleSince = 0;
+    if (context.backBufferBitmap) { DeleteObject(context.backBufferBitmap); context.backBufferBitmap = nullptr; }
+    context.cachedWidth = 0;
+    context.cachedHeight = 0;
+    context.backbufferIdleSince = 0;
 }
 
 HBITMAP Create32BitDIB(int width, int height) {
@@ -1155,413 +1896,594 @@ HBITMAP Create32BitDIB(int width, int height) {
 }
 
 HDC GetScreenDC() {
-    if (!g_screenDc) g_screenDc = GetDC(nullptr);
-    return g_screenDc;
+    if (!context.screenDc) context.screenDc = GetDC(nullptr);
+    return context.screenDc;
 }
 
 void ReleaseScreenDC() {
-    if (!g_screenDc) return;
-    ReleaseDC(nullptr, g_screenDc);
-    g_screenDc = nullptr;
+    if (!context.screenDc) return;
+    ReleaseDC(nullptr, context.screenDc);
+    context.screenDc = nullptr;
 }
 
-void HideOverlay() {
-    const HWND hwnd = g_overlayHwnd.load();
-    if (!hwnd || !IsWindow(hwnd) || !g_windowVisible) return;
-    ShowWindow(hwnd, SW_HIDE);
-    g_windowVisible = false;
+// Layered-window backbuffer growth, binding and D2D resource setup.
+
+
+static int GrowBackbufferDimension(int required, int current) {
+    if (required <= current) return current;
+
+    const int64_t rounded = (
+        (static_cast<int64_t>(required) + kBackbufferGrowthGranularity - 1)
+        / kBackbufferGrowthGranularity
+    ) * kBackbufferGrowthGranularity;
+    return rounded <= std::numeric_limits<int>::max()
+        ? static_cast<int>(rounded)
+        : required;
 }
 
-void ShowOverlay() {
-    const HWND hwnd = g_overlayHwnd.load();
-    if (!hwnd || !IsWindow(hwnd) || g_windowVisible) return;
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    g_windowVisible = true;
-}
-
-void HistoryClear() { g_historyHead = 0; g_historyCount = 0; }
-
-static void ResetTrailState() {
-    HistoryClear();
-    g_isSmearing = false;
-    g_lowVelocityFrames = 0;
-    g_fadeAlpha = 0.0f;
-}
-
-// The overlay only needs to be hidden from screen capture while Auto color mode
-// is sampling the screen background, otherwise the sample would pick up the
-// trail's own pixels. In Manual mode the overlay stays capturable so the trail
-// shows up in screenshots and screen shares.
-static void ApplyOverlayCaptureAffinity() {
-    const HWND hwnd = g_overlayHwnd.load(std::memory_order_acquire);
-    if (!hwnd || !IsWindow(hwnd)) return;
-    if (!SetWindowDisplayAffinity(hwnd, g_trailColorMode == 1 ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE)) {
-        Wh_Log(L"SetWindowDisplayAffinity failed: %lu", GetLastError());
+// Growing swaps in a fresh DC and DIB, then rebinds the existing Direct2D
+// target instead of rebuilding every brush, layer, and device bitmap. The new
+// surface is built first, so the old one stays usable if anything fails.
+static bool SwapBackbufferSurface(int newWidth, int newHeight, HDC referenceDc) {
+    HDC newDc = CreateCompatibleDC(referenceDc);
+    if (!newDc) return false;
+    HBITMAP newBitmap = Create32BitDIB(newWidth, newHeight);
+    if (!newBitmap) {
+        DeleteDC(newDc);
+        return false;
     }
-}
+    const HGDIOBJ newOriginalBitmap = SelectObject(newDc, newBitmap);
+    if (!newOriginalBitmap || newOriginalBitmap == HGDI_ERROR) {
+        DeleteObject(newBitmap);
+        DeleteDC(newDc);
+        return false;
+    }
 
-void HistoryPushFront(const POINT& point) {
-    if (g_historyCount == kHistoryCapacity) --g_historyCount;
-    g_historyHead = (g_historyHead - 1 + kHistoryCapacity) % kHistoryCapacity;
-    g_history[g_historyHead] = point;
-    ++g_historyCount;
-}
+    if (context.renderTarget) {
+        const RECT bindRect = {0, 0, newWidth, newHeight};
+        if (FAILED(context.renderTarget->BindDC(newDc, &bindRect))) {
+            // A failed rebind leaves the old binding in an unknown state, so
+            // rebuild the target on the next frame and keep the new surface.
+            ReleaseRenderResources();
+        } else {
+            context.dcBound = true;
+        }
+    }
 
-void HistoryPopBack() { if (g_historyCount > 0) --g_historyCount; }
-
-const POINT& HistoryAt(int index) { return g_history[(g_historyHead + index) % kHistoryCapacity]; }
-
-static bool GetProcessExeName(DWORD pid, std::wstring& out) {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return false;
-    WCHAR path[512] = {};
-    DWORD size = ARRAYSIZE(path);
-    const BOOL success = QueryFullProcessImageNameW(process, 0, path, &size);
-    CloseHandle(process);
-    if (!success) return false;
-    const wchar_t* name = wcsrchr(path, L'\\');
-    out = ToLowerW(name ? name + 1 : path);
+    HDC oldDc = context.backBufferDc;
+    HBITMAP oldBitmap = context.backBufferBitmap;
+    HGDIOBJ oldOriginalBitmap = context.originalBitmap;
+    context.backBufferDc = newDc;
+    context.backBufferBitmap = newBitmap;
+    context.originalBitmap = newOriginalBitmap;
+    if (oldDc) {
+        if (oldOriginalBitmap) SelectObject(oldDc, oldOriginalBitmap);
+        DeleteDC(oldDc);
+    }
+    if (oldBitmap) DeleteObject(oldBitmap);
     return true;
 }
 
-static void ParseAppRuleEntry(const wchar_t* text) {
-    if (!text) return;
-
-    std::wstring ruleText(text);
-    const size_t comment = ruleText.find(L'#');
-    if (comment != std::wstring::npos) ruleText.resize(comment);
-    const size_t equals = ruleText.find(L'=');
-    if (equals == std::wstring::npos) return;
-
-    std::wstring exe = ruleText.substr(0, equals);
-    std::wstring value = ruleText.substr(equals + 1);
-    const auto trim = [](std::wstring& item) {
-        const size_t first = item.find_first_not_of(L" \t");
-        if (first == std::wstring::npos) {
-            item.clear();
-            return;
-        }
-        const size_t last = item.find_last_not_of(L" \t");
-        item = item.substr(first, last - first + 1);
-    };
-    trim(exe);
-    trim(value);
-
-    const bool enabled = _wcsicmp(value.c_str(), L"on") == 0
-        || value == L"1"
-        || _wcsicmp(value.c_str(), L"true") == 0
-        || _wcsicmp(value.c_str(), L"yes") == 0;
-    const bool disabled = _wcsicmp(value.c_str(), L"off") == 0
-        || value == L"0"
-        || _wcsicmp(value.c_str(), L"false") == 0
-        || _wcsicmp(value.c_str(), L"no") == 0;
-    if (!exe.empty() && (enabled || disabled)) {
-        g_appRules.push_back({ToLowerW(exe), enabled});
-    }
+bool EnsureBackbuffer(int width, int height, HDC referenceDc) {
+    if (width <= 0 || height <= 0 || !referenceDc) return false;
+    if (context.backBufferDc && context.backBufferBitmap && width <= context.cachedWidth && height <= context.cachedHeight) return true;
+    const int newWidth = GrowBackbufferDimension(width, context.cachedWidth);
+    const int newHeight = GrowBackbufferDimension(height, context.cachedHeight);
+    if (!SwapBackbufferSurface(newWidth, newHeight, referenceDc)) return false;
+    context.cachedWidth = newWidth;
+    context.cachedHeight = newHeight;
+    context.backbufferIdleSince = 0;
+    return true;
 }
 
-static void ParseAppRules() {
-    g_appRules.clear();
-
-    constexpr int kMaxAppRuleEntries = 64;
-    int consecutiveEmptyEntries = 0;
-    for (int index = 0; index < kMaxAppRuleEntries; ++index) {
-        WindhawkUtils::StringSetting setting =
-            WindhawkUtils::StringSetting::make(L"Application.app_rules[%d]", index);
-        const wchar_t* value = setting.get();
-        if (!value || !*value) {
-            if (++consecutiveEmptyEntries >= 2) break;
-            continue;
-        }
-
-        consecutiveEmptyEntries = 0;
-        ParseAppRuleEntry(value);
-    }
-}
-
-static int CheckAppRuleCached(HWND foreground) {
-    if (foreground == g_cachedForegroundWindow) return g_cachedAppRule;
-    g_cachedForegroundWindow = foreground;
-    g_cachedAppRule = 0;
-    if (!foreground || g_appRules.empty()) return 0;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(foreground, &pid);
-    if (!pid) return 0;
-    std::wstring exe;
-    if (!GetProcessExeName(pid, exe)) return 0;
-    for (const auto& rule : g_appRules) {
-        if (wcscmp(rule.exe.c_str(), exe.c_str()) == 0) {
-            g_cachedAppRule = rule.enabled ? 1 : -1;
-            break;
-        }
-    }
-    return g_cachedAppRule;
-}
-
-static void ClearRipples();
-static void ClearMotionAccents();
-static void ResetMotionCueTracking();
-static bool OrnamentActive();
-
-static void TrimOrnamentText(std::wstring& text) {
-    const size_t first = text.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring::npos) {
-        text.clear();
+static void MaybeReleaseIdleBackbuffer(DWORD now, LONGLONG nowQpc) {
+    if (context.isSmearing || context.historyCount > 0 || HasActiveRipples(nowQpc) || OrnamentActive()) {
+        context.backbufferIdleSince = 0;
         return;
     }
-    const size_t last = text.find_last_not_of(L" \t\r\n");
-    text = text.substr(first, last - first + 1);
+    if (!context.backBufferDc || !context.backBufferBitmap) {
+        context.backbufferIdleSince = 0;
+        return;
+    }
+    if (context.backbufferIdleSince == 0) {
+        context.backbufferIdleSince = now;
+        return;
+    }
+    if (now - context.backbufferIdleSince >= kBackbufferIdleReleaseDelayMs) {
+        ReleaseBackbuffer();
+    }
 }
 
-static bool LooksLikeOrnamentPath(const std::wstring& text) {
-    return text.find(L'\\') != std::wstring::npos
-        || text.find(L'/') != std::wstring::npos
-        || text.find(L':') != std::wstring::npos;
+bool EnsureD2DResources() {
+    if (!context.d2dFactory) return false;
+    if (context.renderTarget) return true;
+    const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    HRESULT hr = context.d2dFactory->CreateDCRenderTarget(&properties, &context.renderTarget);
+    if (FAILED(hr) || !context.renderTarget) return false;
+    hr = context.renderTarget->CreateSolidColorBrush(ToColorF(context.currentOuterRGB, 1.0f), &context.outerBrush);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    hr = context.renderTarget->CreateSolidColorBrush(ToColorF(context.currentCoreRGB, 1.0f), &context.coreBrush);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    hr = context.renderTarget->CreateSolidColorBrush(ToColorF(context.glowRGB, 1.0f), &context.glowBrush);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    context.outerBrushColorCache = context.currentOuterRGB;
+    context.coreBrushColorCache = context.currentCoreRGB;
+    context.glowBrushColorCache = context.glowRGB;
+    hr = context.renderTarget->CreateLayer(nullptr, &context.trailOpacityLayer);
+    if (FAILED(hr) || !context.trailOpacityLayer) { ReleaseRenderResources(); return false; }
+    hr = context.renderTarget->CreateLayer(nullptr, &context.glowOpacityLayer);
+    if (FAILED(hr) || !context.glowOpacityLayer) { ReleaseRenderResources(); return false; }
+    hr = context.renderTarget->CreateSolidColorBrush(ToColorF(context.leftClickRGB, 1.0f), &context.rippleBrush);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    hr = context.renderTarget->CreateSolidColorBrush(ToColorF(context.currentCoreRGB, 1.0f), &context.ornamentBrush);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    D2D1_STROKE_STYLE_PROPERTIES strokeProperties = {};
+    strokeProperties.startCap = D2D1_CAP_STYLE_ROUND;
+    strokeProperties.endCap = D2D1_CAP_STYLE_ROUND;
+    strokeProperties.lineJoin = D2D1_LINE_JOIN_ROUND;
+    hr = context.d2dFactory->CreateStrokeStyle(strokeProperties, nullptr, 0, &context.strokeStyle);
+    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
+    return true;
 }
 
-// Preset keys are matched case-insensitively. An unknown value falls back to
-// the first preset so a stale or hand-edited key still renders something.
-static OrnamentPreset ParseOrnamentPreset(const wchar_t* value) {
-    if (value && *value) {
-        for (size_t i = 0; i < _countof(kOrnamentPresets); ++i) {
-            if (_wcsicmp(kOrnamentPresets[i].key, value) == 0) {
-                return static_cast<OrnamentPreset>(i);
-            }
+bool EnsureGradientBrush() {
+    if (!context.gradientEnabled) {
+        if (context.gradientBrush) { context.gradientBrush->Release(); context.gradientBrush = nullptr; }
+        if (context.gradientStops) { context.gradientStops->Release(); context.gradientStops = nullptr; }
+        context.gradientHeadCache = 0xFFFFFFFFu;
+        context.gradientTailCache = 0xFFFFFFFFu;
+        return false;
+    }
+    if (!context.renderTarget) return false;
+    if (context.gradientBrush && context.gradientStops && context.gradientHeadCache == context.currentCoreRGB && context.gradientTailCache == context.gradientTailRGB) return true;
+    if (context.gradientBrush) { context.gradientBrush->Release(); context.gradientBrush = nullptr; }
+    if (context.gradientStops) { context.gradientStops->Release(); context.gradientStops = nullptr; }
+    D2D1_GRADIENT_STOP stops[2] = {};
+    stops[0].position = 0.0f;
+    stops[0].color = ToColorF(context.currentCoreRGB, 1.0f);
+    stops[1].position = 1.0f;
+    stops[1].color = ToColorF(context.gradientTailRGB, 1.0f);
+    HRESULT hr = context.renderTarget->CreateGradientStopCollection(stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &context.gradientStops);
+    if (FAILED(hr)) return false;
+    const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES properties = {};
+    hr = context.renderTarget->CreateLinearGradientBrush(properties, context.gradientStops, &context.gradientBrush);
+    if (FAILED(hr)) { context.gradientStops->Release(); context.gradientStops = nullptr; return false; }
+    context.gradientHeadCache = context.currentCoreRGB;
+    context.gradientTailCache = context.gradientTailRGB;
+    return true;
+}
+
+// Trail smoothing, taper lookup and ribbon geometry.
+
+
+static void EnsureTaperLut() {
+    if (context.taperLutReady) return;
+    for (int powerIndex = 0; powerIndex < kTaperPowerCount; ++powerIndex) {
+        const float power =
+            static_cast<float>(kTaperPowerSettingMin + powerIndex) / 10.0f;
+        float* row = context.taperLut[powerIndex];
+        for (int i = 0; i < kTaperLutSteps; ++i) {
+            const float ratio =
+                static_cast<float>(i) / static_cast<float>(kTaperLutSteps);
+            row[i] = powf(1.0f - ratio, power);
         }
+        row[kTaperLutSteps] = 0.0f;
     }
-    return OrnamentPreset::Classic;
+    context.taperLutReady = true;
 }
-
-// The legacy `Ornament.images[0]` entry is read only when the new single-image
-// setting is empty, so an upgrading user keeps the pendant they configured.
-static void LoadOrnamentImageSpec() {
-    g_ornamentImageSpecs.clear();
-    std::wstring path;
-    WindhawkUtils::StringSetting imageSetting =
-        WindhawkUtils::StringSetting::make(L"Ornament.image");
-    if (imageSetting.get()) path = imageSetting.get();
-    TrimOrnamentText(path);
-    if (path.empty()) {
-        WindhawkUtils::StringSetting legacySetting =
-            WindhawkUtils::StringSetting::make(L"Ornament.images[0]");
-        if (legacySetting.get()) {
-            std::wstring entry = legacySetting.get();
-            TrimOrnamentText(entry);
-            const size_t equals = entry.find(L'=');
-            if (equals != std::wstring::npos) {
-                std::wstring candidateId = entry.substr(0, equals);
-                std::wstring candidatePath = entry.substr(equals + 1);
-                TrimOrnamentText(candidateId);
-                TrimOrnamentText(candidatePath);
-                if (!candidatePath.empty() && !LooksLikeOrnamentPath(candidateId)) {
-                    entry = std::move(candidatePath);
-                }
-            }
-            TrimOrnamentText(entry);
-            path = std::move(entry);
+inline void TrailRenderCache::PrepareTaper() {
+        if (pointCount <= 1) return;
+        if (taperCacheValid &&
+            cachedTaperPointCount == pointCount &&
+            cachedTaperPowerIndex == context.taperPowerIndex) {
+            return;
         }
-    }
-    if (path.empty()) return;
-    OrnamentImageSpec spec;
-    spec.id = L"pendant";
-    spec.path = std::move(path);
-    g_ornamentImageSpecs.push_back(std::move(spec));
-}
 
-// The selected preset owns the anchor, physics, reaction impulses, and node
-// layout. Nodes always exist, so an empty image still renders the circular
-// fallback of the draw path.
-static void ApplyOrnamentPreset(OrnamentPreset preset) {
-    const OrnamentPresetDefinition& definition =
-        kOrnamentPresets[static_cast<size_t>(preset)];
-    g_ornamentAnchorOffsetX = definition.anchorOffsetX;
-    g_ornamentAnchorOffsetY = definition.anchorOffsetY;
-    g_ornamentGravity = definition.gravity;
-    g_ornamentDamping = definition.damping;
-    g_ornamentConstraintIterations = definition.constraintIterations;
-    g_ornamentStretch = definition.stretch;
-    g_ornamentOpacity = definition.opacity;
-    g_ornamentClickImpulse = definition.clickImpulse;
-    g_ornamentWheelImpulse = definition.wheelImpulse;
-    g_ornamentRopeSegments = definition.ropeSegments;
-    g_ornamentRopeLengthPx = definition.ropeLengthPx * g_ornamentRopeLengthScale;
-    g_ornamentRopeStyle = definition.ropeStyle;
-    g_ornamentRopeWidthPx = definition.ropeWidthPx;
-    g_ornamentRopeOpacity = definition.ropeOpacity;
-
-    g_ornamentNodeSpecs.clear();
-    const int nodeCount = std::clamp(definition.nodeCount, 0, kOrnamentMaxPresetNodes);
-    g_ornamentNodeSpecs.reserve(static_cast<size_t>(nodeCount));
-    for (int i = 0; i < nodeCount; ++i) {
-        const OrnamentPresetNode& presetNode = definition.nodes[i];
-        OrnamentNodeSpec spec;
-        if (!g_ornamentImageSpecs.empty()) {
-            spec.imageId = g_ornamentImageSpecs.front().id;
+        EnsureTaperLut();
+        const int lutPower = std::clamp(
+            context.taperPowerIndex - kTaperPowerSettingMin,
+            0,
+            kTaperPowerCount - 1);
+        const float* row = context.taperLut[lutPower];
+        const float scale =
+            static_cast<float>(kTaperLutSteps) /
+            static_cast<float>(pointCount - 1);
+        for (int i = 0; i + 1 < pointCount; ++i) {
+            const float position = static_cast<float>(i) * scale;
+            const int lutIndex = static_cast<int>(position);
+            const float fraction = position - static_cast<float>(lutIndex);
+            const float low = row[lutIndex];
+            const float high = row[lutIndex + 1];
+            taper[i] = low + (high - low) * fraction;
         }
-        spec.ropeT = presetNode.ropeT;
-        spec.sizePx = presetNode.sizePx;
-        spec.opacity = presetNode.opacity;
-        spec.angleDegrees = presetNode.angleDegrees;
-        g_ornamentNodeSpecs.push_back(std::move(spec));
+        taper[pointCount - 1] = 0.0f;
+
+        cachedTaperPointCount = pointCount;
+        cachedTaperPowerIndex = context.taperPowerIndex;
+        taperCacheValid = true;
+}
+void SmoothTrail(int iterations, int renderLength) {
+    D2D1_POINT_2F* current = context.renderCache.pointsA;
+    D2D1_POINT_2F* next = context.renderCache.pointsB;
+    const int pointCount = std::min(context.historyCount, std::max(renderLength, 2));
+    int currentCount = 0;
+    const float offsetX = static_cast<float>(context.tailOffsetX) * context.currentDpiScale;
+    const float offsetY = static_cast<float>(context.tailOffsetY) * context.currentDpiScale;
+    for (int i = 0; i < pointCount; ++i) {
+        const POINT& point = HistoryAt(i);
+        current[currentCount++] = D2D1::Point2F(
+            static_cast<float>(point.x) + offsetX,
+            static_cast<float>(point.y) + offsetY);
     }
+    const int iterationLimit = std::clamp(
+        iterations, 0, kMaxSmoothIterations);
+    for (int iteration = 0; iteration < iterationLimit && currentCount >= 3;
+         ++iteration) {
+        if (currentCount > kMaxTrailRenderPoints / 2) break;
+        int nextCount = 0;
+        next[nextCount++] = current[0];
+        for (int i = 0; i + 1 < currentCount; ++i) {
+            const D2D1_POINT_2F& a = current[i];
+            const D2D1_POINT_2F& b = current[i + 1];
+            next[nextCount++] = D2D1::Point2F(
+                0.75f * a.x + 0.25f * b.x,
+                0.75f * a.y + 0.25f * b.y);
+            next[nextCount++] = D2D1::Point2F(
+                0.25f * a.x + 0.75f * b.x,
+                0.25f * a.y + 0.75f * b.y);
+        }
+        next[nextCount++] = current[currentCount - 1];
+        currentCount = nextCount;
+        D2D1_POINT_2F* swap = current;
+        current = next;
+        next = swap;
+    }
+    context.renderCache.activePoints = current;
+    context.renderCache.pointCount = currentCount;
+    ++context.renderCache.generation;
+    context.renderCache.PrepareTaper();
 }
 
-void LoadSettings() {
-    g_triggerVelocity = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Behavior.trigger_velocity"), 50, 20000));
-    g_stopVelocity = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Behavior.stop_velocity"), 50, 20000));
-    if (g_stopVelocity >= g_triggerVelocity) g_stopVelocity = std::max(50.0f, g_triggerVelocity * 0.5f);
-    g_tailOffsetX = std::clamp(Wh_GetIntSetting(L"Behavior.tail_offset_x"), -64, 64);
-    g_tailOffsetY = std::clamp(Wh_GetIntSetting(L"Behavior.tail_offset_y"), -64, 64);
-    g_tailLength = std::clamp(Wh_GetIntSetting(L"Behavior.tail_length"), 2, kMaxTailLength);
-    g_speedScaling = std::clamp(Wh_GetIntSetting(L"Behavior.speed_scaling"), 0, 1);
-    g_widthMin = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Appearance.width_min"), 1, 40));
-    g_widthMax = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Appearance.width_max"), 1, 60));
-    g_coreWidthMin = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Appearance.core_width_min"), 1, 40));
-    g_coreWidthMax = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Appearance.core_width_max"), 1, 60));
-    g_alphaMin = std::clamp(Wh_GetIntSetting(L"Appearance.alpha_min"), 0, 100) / 100.0f;
-    g_alphaMax = std::clamp(Wh_GetIntSetting(L"Appearance.alpha_max"), 0, 100) / 100.0f;
-    g_taperPowerIndex = std::clamp(
-        Wh_GetIntSetting(L"Appearance.taper_power"),
-        kTaperPowerSettingMin,
-        kTaperPowerSettingMax);
-    if (g_widthMax < g_widthMin) std::swap(g_widthMin, g_widthMax);
-    if (g_coreWidthMax < g_coreWidthMin) std::swap(g_coreWidthMin, g_coreWidthMax);
-    g_smoothIterations = std::clamp(
-        Wh_GetIntSetting(L"Appearance.smooth_iterations"),
-        0,
-        kMaxSmoothIterations);
-    g_gradientEnabled = std::clamp(Wh_GetIntSetting(L"Effects.gradient_enabled"), 0, 1);
-    {
-        uint32_t parsed = 0;
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Effects.gradient_tail_color");
-        g_gradientTailRGB = ParseHexColor(value.get(), parsed) ? parsed : 0x00FF00FF;
+RECT CalculateTrailBounds(float maxHalfWidth) {
+    const int pointCount = context.renderCache.pointCount;
+    if (pointCount <= 0) return {0, 0, 0, 0};
+    const D2D1_POINT_2F* points = context.renderCache.activePoints;
+    float minX = points[0].x;
+    float minY = points[0].y;
+    float maxX = minX;
+    float maxY = minY;
+    for (int i = 1; i < pointCount; ++i) {
+        const D2D1_POINT_2F& point = points[i];
+        minX = std::min(minX, point.x);
+        minY = std::min(minY, point.y);
+        maxX = std::max(maxX, point.x);
+        maxY = std::max(maxY, point.y);
     }
-    g_glowEnabled = std::clamp(Wh_GetIntSetting(L"Effects.glow_enabled"), 0, 1);
-    {
-        uint32_t parsed = 0;
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Effects.glow_color");
-        g_glowRGB = ParseHexColor(value.get(), parsed) ? parsed : 0x00FFFFFF;
-    }
-    g_glowWidthFactor = std::clamp(Wh_GetIntSetting(L"Effects.glow_width_factor"), 10, 30) / 10.0f;
-    g_glowAlpha = std::clamp(Wh_GetIntSetting(L"Effects.glow_alpha"), 0, 100) / 100.0f;
-    g_fadeEnabled = std::clamp(Wh_GetIntSetting(L"Behavior.fade_enabled"), 0, 1);
-    g_fadeDecay = std::clamp(Wh_GetIntSetting(L"Behavior.fade_decay"), 50, 99) / 100.0f;
-    {
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Color.trail_color_mode");
-        g_trailColorMode = _wcsicmp(value.get(), L"auto") == 0 ? 1 : 0;
-    }
-    {
-        uint32_t parsed = 0;
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Color.trail_color_manual");
-        g_manualColorRGB = ParseHexColor(value.get(), parsed) ? parsed : kFallbackCoreColor;
-    }
-    {
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Color.outline_color_mode");
-        g_outlineColorMode = _wcsicmp(value.get(), L"manual") == 0 ? 1 : 0;
-    }
-    {
-        uint32_t parsed = 0;
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Color.outline_color_manual");
-        g_manualOutlineRGB = ParseHexColor(value.get(), parsed) ? parsed : kFallbackOuterColor;
-    }
-    g_autoResampleInterval = std::clamp(Wh_GetIntSetting(L"Color.auto_resample_interval"), 0, kAutoResampleIntervalMaxMs);
-    g_clickFeedbackEnabled = std::clamp(Wh_GetIntSetting(L"Interaction.click_feedback_enabled"), 0, 1);
-    g_wheelFeedbackEnabled = std::clamp(Wh_GetIntSetting(L"Interaction.wheel_feedback_enabled"), 0, 1);
-    if (!g_clickFeedbackEnabled && !g_wheelFeedbackEnabled) ClearRipples();
-    g_rippleRadius = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Interaction.ripple_radius"), 10, 200));
-    g_wheelArrowSize = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Interaction.wheel_arrow_size"), 6, 40));
-    g_wheelArrowDistance = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Interaction.wheel_arrow_distance"), 8, 120));
-    g_rippleDurationMs = std::clamp(Wh_GetIntSetting(L"Interaction.ripple_duration_ms"), 100, 2000);
-    g_rippleStrokeWidth = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Interaction.ripple_width"), 1, 10));
-    g_rippleOpacity = std::clamp(Wh_GetIntSetting(L"Interaction.ripple_opacity"), 5, 100) / 100.0f;
-    const auto readInteractionColor = [](const wchar_t* settingPath, uint32_t fallbackColor) {
-        uint32_t parsedColor = 0;
-        WindhawkUtils::StringSetting value = WindhawkUtils::StringSetting::make(settingPath);
-        return ParseHexColor(value.get(), parsedColor) ? parsedColor : fallbackColor;
+    const float padding = maxHalfWidth + kRenderPadding;
+    RECT result = {
+        static_cast<LONG>(floorf(minX - padding)),
+        static_cast<LONG>(floorf(minY - padding)),
+        static_cast<LONG>(ceilf(maxX + padding)),
+        static_cast<LONG>(ceilf(maxY + padding)),
     };
-    g_leftClickRGB = readInteractionColor(L"Interaction.left_click_color", 0x0000D7FF);
-    g_rightClickRGB = readInteractionColor(L"Interaction.right_click_color", 0x00FF4C8B);
-    g_middleClickRGB = readInteractionColor(L"Interaction.middle_click_color", 0x00FFD166);
-    g_wheelUpRGB = readInteractionColor(L"Interaction.wheel_up_color", 0x007CFF6B);
-    g_wheelDownRGB = readInteractionColor(L"Interaction.wheel_down_color", 0x00A78BFA);
-    g_accelerationAccentEnabled = std::clamp(Wh_GetIntSetting(L"Motion.acceleration_accent_enabled"), 0, 1);
-    g_turnAccentEnabled = std::clamp(Wh_GetIntSetting(L"Motion.turn_accent_enabled"), 0, 1);
-    g_fastMoveInterpolationEnabled = std::clamp(Wh_GetIntSetting(L"Motion.fast_move_interpolation"), 0, 1);
-    g_accelerationThreshold = std::clamp(Wh_GetIntSetting(L"Motion.acceleration_threshold"), 3000, 100000);
-    g_motionAccentOpacity = std::clamp(Wh_GetIntSetting(L"Motion.motion_accent_opacity"), 10, 100) / 100.0f;
-    g_turnAngleDegrees = std::clamp(Wh_GetIntSetting(L"Motion.turn_angle_degrees"), 45, 150);
-    g_turnAccentCosThreshold = cosf(
-        static_cast<float>(g_turnAngleDegrees) * kDegreesToRadians);
-    g_motionAccentDurationMs = std::clamp(Wh_GetIntSetting(L"Motion.motion_accent_duration_ms"), 80, 1000);
-    g_motionAccentSize = static_cast<float>(std::clamp(Wh_GetIntSetting(L"Motion.motion_accent_size"), 4, 40));
-    g_maxInterpolationSteps = std::clamp(Wh_GetIntSetting(L"Motion.max_interpolation_steps"), 1, 6);
-    g_motionAccentRGB = readInteractionColor(L"Motion.motion_accent_color", 0x00FFD166);
-    g_ornamentEnabled = std::clamp(Wh_GetIntSetting(L"Ornament.enabled"), 0, 1);
-    OrnamentPreset ornamentPreset = OrnamentPreset::Classic;
-    {
-        WindhawkUtils::StringSetting value =
-            WindhawkUtils::StringSetting::make(L"Ornament.preset");
-        ornamentPreset = ParseOrnamentPreset(value.get());
-    }
-    // A settings blob written before this key existed reads as 0, so fall back
-    // to the preset length instead of clamping to the shortest rope.
-    const int ropeLengthScalePct =
-        Wh_GetIntSetting(L"Ornament.rope_length_scale");
-    g_ornamentRopeLengthScale =
-        std::clamp(ropeLengthScalePct > 0 ? ropeLengthScalePct : 100, 25, 400) / 100.0f;
-    LoadOrnamentImageSpec();
-    ApplyOrnamentPreset(ornamentPreset);
-    g_ornamentAssetsDirty.store(true, std::memory_order_release);
-    ResetMotionCueTracking();
-    ParseAppRules();
-    g_cachedForegroundWindow = nullptr;
-    g_cachedAppRule = 0;
-    g_autoColorInitialized = false;
-    g_lastAutoColorCursor = nullptr;
-    g_lastAutoColorUpdate = 0;
-    if (g_trailColorMode == 0) {
-        SetTrailCoreColor(g_manualColorRGB, RgbLuminance(g_manualColorRGB));
-    } else {
-        SetTrailCoreColor(g_currentCoreRGB, g_currentCoreLuminance);
-    }
-    ApplyOverlayCaptureAffinity();
+    if (result.right <= result.left) result.right = result.left + 1;
+    if (result.bottom <= result.top) result.bottom = result.top + 1;
+    return result;
 }
+
+static void DrawTrailStroke(ID2D1RenderTarget* target, ID2D1Brush* brush, float halfWidth, bool drawHead) {
+    const int pointCount = context.renderCache.pointCount;
+    const D2D1_POINT_2F* points = context.renderCache.activePoints;
+    const float* taper = context.renderCache.taper;
+    if (pointCount < 2 || !brush) return;
+    for (int i = 0; i + 1 < pointCount; ++i) {
+        const float width = std::max(0.1f, halfWidth * taper[i] * 2.0f);
+        target->DrawLine(points[i], points[i + 1], brush, width, context.strokeStyle);
+    }
+    if (drawHead) target->FillEllipse(D2D1::Ellipse(points[0], halfWidth, halfWidth), brush);
+}
+static int EnsureTrailRibbon() {
+    if (context.ribbonCache.valid &&
+        context.ribbonCache.generation == context.renderCache.generation) {
+        return context.ribbonCache.centerCount;
+    }
+    context.ribbonCache.valid = true;
+    context.ribbonCache.generation = context.renderCache.generation;
+    context.ribbonCache.centerCount = 0;
+    const int total = context.renderCache.pointCount;
+    if (total < 2) return 0;
+
+    const D2D1_POINT_2F* points = context.renderCache.activePoints;
+    const float* taper = context.renderCache.taper;
+    const int last = total - 1;
+    const float minSpacingSq =
+        kTrailRibbonMinSpacingPx * kTrailRibbonMinSpacingPx;
+    const auto taperAt = [taper, last](int index) {
+        if (index <= 0) return taper[0];
+        if (index >= last) return taper[last - 1];
+        return (taper[index - 1] + taper[index]) * 0.5f;
+    };
+    const auto store = [](int index, D2D1_POINT_2F point, float width) {
+        context.ribbonCache.centers[index] = point;
+        context.ribbonCache.taper[index] = width;
+    };
+
+    int count = 0;
+    store(count++, points[0], taper[0]);
+    int step = (last + kTrailRibbonMaxCenterPoints - 2) /
+               (kTrailRibbonMaxCenterPoints - 1);
+    if (step < 1) step = 1;
+    for (int index = step;
+         index < last && count < kTrailRibbonMaxCenterPoints - 1;
+         index += step) {
+        const D2D1_POINT_2F& previous = context.ribbonCache.centers[count - 1];
+        const float dx = points[index].x - previous.x;
+        const float dy = points[index].y - previous.y;
+        if (dx * dx + dy * dy < minSpacingSq) continue;
+        store(count++, points[index], taperAt(index));
+    }
+
+    // The tail must stay exact so the visible taper ends at the last sample.
+    // A near-duplicate tail replaces the previous center instead of adding a
+    // zero-length segment whose direction would be undefined.
+    const D2D1_POINT_2F& previous = context.ribbonCache.centers[count - 1];
+    const float tailDx = points[last].x - previous.x;
+    const float tailDy = points[last].y - previous.y;
+    if (count == 1 || tailDx * tailDx + tailDy * tailDy >= minSpacingSq) {
+        store(count++, points[last], taperAt(last));
+    } else {
+        store(count - 1, points[last], taperAt(last));
+    }
+
+    float lastDirX = 1.0f;
+    float lastDirY = 0.0f;
+    bool directionKnown = false;
+    for (int i = 0; i < count; ++i) {
+        float previousX = 0.0f;
+        float previousY = 0.0f;
+        float nextX = 0.0f;
+        float nextY = 0.0f;
+        if (i > 0) {
+            previousX = context.ribbonCache.centers[i].x - context.ribbonCache.centers[i - 1].x;
+            previousY = context.ribbonCache.centers[i].y - context.ribbonCache.centers[i - 1].y;
+        }
+        if (i + 1 < count) {
+            nextX = context.ribbonCache.centers[i + 1].x - context.ribbonCache.centers[i].x;
+            nextY = context.ribbonCache.centers[i + 1].y - context.ribbonCache.centers[i].y;
+        }
+        const float dirX = previousX + nextX;
+        const float dirY = previousY + nextY;
+        const float lengthSq = dirX * dirX + dirY * dirY;
+        if (lengthSq > 1.0e-8f) {
+            const float inverseLength = 1.0f / sqrtf(lengthSq);
+            lastDirX = dirX * inverseLength;
+            lastDirY = dirY * inverseLength;
+            directionKnown = true;
+        } else if (!directionKnown) {
+            // A stationary prefix repeats one point. Look ahead once for the
+            // first real segment so the whole prefix shares its normal.
+            for (int next = i + 1; next < count; ++next) {
+                const float forwardX =
+                    context.ribbonCache.centers[next].x - context.ribbonCache.centers[i].x;
+                const float forwardY =
+                    context.ribbonCache.centers[next].y - context.ribbonCache.centers[i].y;
+                const float forwardLengthSq = forwardX * forwardX + forwardY * forwardY;
+                if (forwardLengthSq <= 1.0e-8f) continue;
+                const float inverseLength = 1.0f / sqrtf(forwardLengthSq);
+                lastDirX = forwardX * inverseLength;
+                lastDirY = forwardY * inverseLength;
+                directionKnown = true;
+                break;
+            }
+        }
+        // The averaged unit direction keeps every offset at or below the half
+        // width, so the trail bounds never need to grow for a miter spike.
+        context.ribbonCache.normalX[i] = -lastDirY;
+        context.ribbonCache.normalY[i] = lastDirX;
+        // Zero-length sides only occur at the endpoints, which the head ellipse
+        // and the tail cap already round, so this marks interior reversals only.
+        context.ribbonCache.roundJoin[i] =
+            previousX * previousX + previousY * previousY > 1.0e-8f &&
+            nextX * nextX + nextY * nextY > 1.0e-8f &&
+            previousX * nextX + previousY * nextY < 0.0f;
+    }
+
+    context.ribbonCache.centerCount = count;
+    return count;
+}
+
+static int BuildTrailRibbonOutline(float halfWidth) {
+    const int count = EnsureTrailRibbon();
+    if (count < 2) return 0;
+    const D2D1_POINT_2F* centers = context.ribbonCache.centers;
+    D2D1_POINT_2F* outline = context.ribbonOutline;
+    int outCount = 0;
+    for (int i = 0; i < count; ++i) {
+        const float scaled = halfWidth * context.ribbonCache.taper[i];
+        const float width =
+            scaled > kTrailRibbonMinHalfWidth ? scaled : kTrailRibbonMinHalfWidth;
+        outline[outCount++] = D2D1::Point2F(
+            centers[i].x + context.ribbonCache.normalX[i] * width,
+            centers[i].y + context.ribbonCache.normalY[i] * width);
+    }
+    const int tail = count - 1;
+    const float tailWidth = halfWidth * context.ribbonCache.taper[tail];
+    const float tailRadius =
+        tailWidth > kTrailRibbonMinHalfWidth ? tailWidth : kTrailRibbonMinHalfWidth;
+    const float normalX = context.ribbonCache.normalX[tail];
+    const float normalY = context.ribbonCache.normalY[tail];
+    // The stored normal is the left offset, so the travel direction is the
+    // normal rotated to the right. The cap bulges along that direction.
+    const float capX = normalY;
+    const float capY = -normalX;
+    for (int step = 0; step < kTrailRibbonCapSegments - 1; ++step) {
+        const float cosine = kTrailRibbonCapCos[step] * tailRadius;
+        const float sine = kTrailRibbonCapSin[step] * tailRadius;
+        outline[outCount++] = D2D1::Point2F(
+            centers[tail].x + normalX * cosine + capX * sine,
+            centers[tail].y + normalY * cosine + capY * sine);
+    }
+    for (int i = tail; i >= 0; --i) {
+        const float scaled = halfWidth * context.ribbonCache.taper[i];
+        const float width =
+            scaled > kTrailRibbonMinHalfWidth ? scaled : kTrailRibbonMinHalfWidth;
+        outline[outCount++] = D2D1::Point2F(
+            centers[i].x - context.ribbonCache.normalX[i] * width,
+            centers[i].y - context.ribbonCache.normalY[i] * width);
+    }
+    return outCount;
+}
+
+static bool FillTrailRibbon(
+    ID2D1RenderTarget* target,
+    ID2D1Brush* brush,
+    float halfWidth) {
+    if (!target || !brush) return false;
+    const int outlineCount = BuildTrailRibbonOutline(halfWidth);
+    if (outlineCount < 3) return false;
+    ID2D1PathGeometry* geometry = nullptr;
+    if (FAILED(context.d2dFactory->CreatePathGeometry(&geometry)) || !geometry) {
+        return false;
+    }
+    ID2D1GeometrySink* sink = nullptr;
+    if (FAILED(geometry->Open(&sink)) || !sink) {
+        geometry->Release();
+        return false;
+    }
+    sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+    sink->BeginFigure(context.ribbonOutline[0], D2D1_FIGURE_BEGIN_FILLED);
+    for (int i = 1; i < outlineCount; ++i) sink->AddLine(context.ribbonOutline[i]);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    const HRESULT hr = sink->Close();
+    sink->Release();
+    if (FAILED(hr)) {
+        geometry->Release();
+        return false;
+    }
+    target->FillGeometry(geometry, brush);
+    geometry->Release();
+    const int centerCount = context.ribbonCache.centerCount;
+    for (int i = 1; i + 1 < centerCount; ++i) {
+        if (!context.ribbonCache.roundJoin[i]) continue;
+        float radius = halfWidth * context.ribbonCache.taper[i];
+        if (radius < kTrailRibbonMinHalfWidth) radius = kTrailRibbonMinHalfWidth;
+        if (radius > halfWidth) radius = halfWidth;
+        if (radius <= 0.0f) continue;
+        target->FillEllipse(
+            D2D1::Ellipse(context.ribbonCache.centers[i], radius, radius), brush);
+    }
+    return true;
+}
+
+static void DrawTrailLayer(
+    ID2D1RenderTarget* target,
+    ID2D1Brush* brush,
+    float halfWidth) {
+    if (FillTrailRibbon(target, brush, halfWidth)) {
+        const D2D1_POINT_2F& head = context.ribbonCache.centers[0];
+        target->FillEllipse(
+            D2D1::Ellipse(head, halfWidth, halfWidth), brush);
+        return;
+    }
+    DrawTrailStroke(target, brush, halfWidth, true);
+}
+
+static int GetEffectiveTailLength(float speedNorm) {
+    if (!context.speedScaling) return context.tailLength;
+    return std::max(2, static_cast<int>(context.tailLength * (0.55f + 0.45f * std::clamp(speedNorm, 0.0f, 1.0f))));
+}
+
+void UpdateTrailState(const POINT& previousPoint, const POINT& point, float velocity) {
+    const bool startedSmearing = velocity > context.triggerVelocity && !context.isSmearing;
+    if (startedSmearing) {
+        context.isSmearing = true;
+        context.lowVelocityFrames = 0;
+        context.fadeAlpha = 1.0f;
+        context.smoothedSpeedNorm = 0.0f;
+    } else if (velocity < context.stopVelocity && context.isSmearing) {
+        if (++context.lowVelocityFrames > 2) {
+            context.isSmearing = false;
+            context.frozenSpeedNorm = context.smoothedSpeedNorm;
+        }
+    } else if (context.isSmearing) {
+        context.lowVelocityFrames = 0;
+    }
+    if (context.isSmearing) {
+        if (startedSmearing) {
+            // A fading tail belongs to the previous motion segment. Do not connect
+            // it to a new segment after a discontinuous cursor repositioning.
+            HistoryClear();
+        }
+        const float target = std::clamp((velocity - context.stopVelocity) / (context.triggerVelocity * 2.0f), 0.0f, 1.0f);
+        context.smoothedSpeedNorm = context.smoothedSpeedNorm * 0.55f + target * 0.45f;
+        const float dx = static_cast<float>(point.x - previousPoint.x);
+        const float dy = static_cast<float>(point.y - previousPoint.y);
+        const float distance = sqrtf(dx * dx + dy * dy);
+        int interpolationSteps = 1;
+        // Start from the current point only. A discontinuous cursor repositioning
+        // must not be turned into a streak when the velocity gate first opens.
+        if (!startedSmearing
+            && context.fastMoveInterpolationEnabled
+            && distance > kFastMoveInterpolationSpacingPx) {
+            const int requiredSteps = static_cast<int>(ceilf(distance / kFastMoveInterpolationSpacingPx));
+            interpolationSteps = std::clamp(requiredSteps, 1, context.maxInterpolationSteps + 1);
+        }
+        // History is stored newest-first, so push the interpolated path toward
+        // the current endpoint in ascending order. Work is capped at six points.
+        for (int step = 1; step <= interpolationSteps; ++step) {
+            const float progress = static_cast<float>(step) / interpolationSteps;
+            const POINT sample = {
+                static_cast<LONG>(std::lround(previousPoint.x + dx * progress)),
+                static_cast<LONG>(std::lround(previousPoint.y + dy * progress)),
+            };
+            HistoryPushFront(sample);
+            while (context.historyCount > context.tailLength) HistoryPopBack();
+        }
+    } else if (context.fadeEnabled) {
+        context.fadeAlpha *= context.fadeDecay;
+        if (context.fadeAlpha < kFadeCutoff || context.historyCount < 2) {
+            HistoryClear();
+            context.fadeAlpha = 0.0f;
+        }
+    } else {
+        if (context.historyCount > 0) HistoryPopBack();
+        context.fadeAlpha = 1.0f;
+    }
+}
+
+// Click ripples, motion accents and their state machines.
 
 
 static void ClearRipples() {
-    for (RippleEffect& ripple : g_ripples) {
+    for (RippleEffect& ripple : context.ripples) {
         ripple.active = false;
     }
-    g_nextRippleSlot = 0;
-    g_interactionPending = false;
+    context.nextRippleSlot = 0;
+    context.interactionPending = false;
 }
 
 static void ClearMotionAccents() {
-    for (MotionAccent& accent : g_motionAccents) accent.active = false;
-    g_nextMotionAccentSlot = 0;
+    for (MotionAccent& accent : context.motionAccents) accent.active = false;
+    context.nextMotionAccentSlot = 0;
 }
 
 static void ResetMotionCueTracking() {
     ClearMotionAccents();
-    g_lastMotionCuePoint = {};
-    g_lastMotionCueQpc = 0;
-    g_lastMotionCueSpeed = 0.0f;
-    g_lastMotionDirectionX = 0.0f;
-    g_lastMotionDirectionY = 0.0f;
-    g_hasPreviousMotionCueSample = false;
-    g_accelerationWindowPoint = {};
-    g_accelerationWindowQpc = 0;
-    g_accelerationWindowSpeed = 0.0f;
-    g_hasAccelerationWindowSample = false;
-    g_hasAccelerationWindowSpeed = false;
-    g_lastAccelerationAccentQpc = 0;
-    g_lastTurnAccentQpc = 0;
+    context.lastMotionCuePoint = {};
+    context.lastMotionCueQpc = 0;
+    context.lastMotionCueSpeed = 0.0f;
+    context.lastMotionDirectionX = 0.0f;
+    context.lastMotionDirectionY = 0.0f;
+    context.hasPreviousMotionCueSample = false;
+    context.accelerationWindowPoint = {};
+    context.accelerationWindowQpc = 0;
+    context.accelerationWindowSpeed = 0.0f;
+    context.hasAccelerationWindowSample = false;
+    context.hasAccelerationWindowSpeed = false;
+    context.lastAccelerationAccentQpc = 0;
+    context.lastTurnAccentQpc = 0;
 }
 
 static void AddMotionAccent(
@@ -1574,16 +2496,16 @@ static void AddMotionAccent(
     float previousDirectionY = 0.0f) {
     int selectedSlot = -1;
     for (int offset = 0; offset < kMaxActiveMotionAccents; ++offset) {
-        const int candidateSlot = (g_nextMotionAccentSlot + offset) % kMaxActiveMotionAccents;
-        if (!g_motionAccents[candidateSlot].active) {
+        const int candidateSlot = (context.nextMotionAccentSlot + offset) % kMaxActiveMotionAccents;
+        if (!context.motionAccents[candidateSlot].active) {
             selectedSlot = candidateSlot;
             break;
         }
     }
-    if (selectedSlot < 0) selectedSlot = g_nextMotionAccentSlot;
-    g_nextMotionAccentSlot = (selectedSlot + 1) % kMaxActiveMotionAccents;
+    if (selectedSlot < 0) selectedSlot = context.nextMotionAccentSlot;
+    context.nextMotionAccentSlot = (selectedSlot + 1) % kMaxActiveMotionAccents;
 
-    MotionAccent& accent = g_motionAccents[selectedSlot];
+    MotionAccent& accent = context.motionAccents[selectedSlot];
     accent.center = center;
     accent.directionX = directionX;
     accent.directionY = directionY;
@@ -1597,9 +2519,9 @@ static void AddMotionAccent(
 
 static int UpdateMotionAccentState(LONGLONG nowQpc) {
     const LONGLONG durationTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(g_motionAccentDurationMs) / 1000);
+        1, context.qpcFrequency * static_cast<LONGLONG>(context.motionAccentDurationMs) / 1000);
     int activeCount = 0;
-    for (MotionAccent& accent : g_motionAccents) {
+    for (MotionAccent& accent : context.motionAccents) {
         if (!accent.active) continue;
         const LONGLONG elapsedTicks = nowQpc - accent.startQpc;
         if (elapsedTicks < 0 || elapsedTicks >= durationTicks) {
@@ -1616,153 +2538,153 @@ static bool HasActiveMotionAccents(LONGLONG nowQpc) {
 }
 
 static void UpdateMotionCueTracking(const POINT& point, LONGLONG nowQpc) {
-    if (!g_accelerationAccentEnabled && !g_turnAccentEnabled) {
-        g_lastMotionCuePoint = point;
-        g_lastMotionCueQpc = nowQpc;
-        g_lastMotionCueSpeed = 0.0f;
-        g_lastMotionDirectionX = 0.0f;
-        g_lastMotionDirectionY = 0.0f;
-        g_hasPreviousMotionCueSample = false;
-        g_accelerationWindowPoint = point;
-        g_accelerationWindowQpc = nowQpc;
-        g_accelerationWindowSpeed = 0.0f;
-        g_hasAccelerationWindowSample = false;
-        g_hasAccelerationWindowSpeed = false;
+    if (!context.accelerationAccentEnabled && !context.turnAccentEnabled) {
+        context.lastMotionCuePoint = point;
+        context.lastMotionCueQpc = nowQpc;
+        context.lastMotionCueSpeed = 0.0f;
+        context.lastMotionDirectionX = 0.0f;
+        context.lastMotionDirectionY = 0.0f;
+        context.hasPreviousMotionCueSample = false;
+        context.accelerationWindowPoint = point;
+        context.accelerationWindowQpc = nowQpc;
+        context.accelerationWindowSpeed = 0.0f;
+        context.hasAccelerationWindowSample = false;
+        context.hasAccelerationWindowSpeed = false;
         return;
     }
 
-    if (!g_hasPreviousMotionCueSample) {
-        g_lastMotionCuePoint = point;
-        g_lastMotionCueQpc = nowQpc;
-        g_lastMotionCueSpeed = 0.0f;
-        g_lastMotionDirectionX = 0.0f;
-        g_lastMotionDirectionY = 0.0f;
-        g_hasPreviousMotionCueSample = true;
-        g_accelerationWindowPoint = point;
-        g_accelerationWindowQpc = nowQpc;
-        g_accelerationWindowSpeed = 0.0f;
-        g_hasAccelerationWindowSample = true;
-        g_hasAccelerationWindowSpeed = false;
+    if (!context.hasPreviousMotionCueSample) {
+        context.lastMotionCuePoint = point;
+        context.lastMotionCueQpc = nowQpc;
+        context.lastMotionCueSpeed = 0.0f;
+        context.lastMotionDirectionX = 0.0f;
+        context.lastMotionDirectionY = 0.0f;
+        context.hasPreviousMotionCueSample = true;
+        context.accelerationWindowPoint = point;
+        context.accelerationWindowQpc = nowQpc;
+        context.accelerationWindowSpeed = 0.0f;
+        context.hasAccelerationWindowSample = true;
+        context.hasAccelerationWindowSpeed = false;
         return;
     }
 
-    const LONGLONG elapsedTicks = nowQpc - g_lastMotionCueQpc;
+    const LONGLONG elapsedTicks = nowQpc - context.lastMotionCueQpc;
     const LONGLONG resumeGapTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(kMotionResumeGapMs) / 1000);
+        1, context.qpcFrequency * static_cast<LONGLONG>(kMotionResumeGapMs) / 1000);
     if (elapsedTicks <= 0 || elapsedTicks > resumeGapTicks) {
         // Rebase after idle; do not interpret time spent idle as acceleration or a turn.
-        g_lastMotionCuePoint = point;
-        g_lastMotionCueQpc = nowQpc;
-        g_lastMotionCueSpeed = 0.0f;
-        g_lastMotionDirectionX = 0.0f;
-        g_lastMotionDirectionY = 0.0f;
-        g_hasPreviousMotionCueSample = true;
-        g_accelerationWindowPoint = point;
-        g_accelerationWindowQpc = nowQpc;
-        g_accelerationWindowSpeed = 0.0f;
-        g_hasAccelerationWindowSample = true;
-        g_hasAccelerationWindowSpeed = false;
+        context.lastMotionCuePoint = point;
+        context.lastMotionCueQpc = nowQpc;
+        context.lastMotionCueSpeed = 0.0f;
+        context.lastMotionDirectionX = 0.0f;
+        context.lastMotionDirectionY = 0.0f;
+        context.hasPreviousMotionCueSample = true;
+        context.accelerationWindowPoint = point;
+        context.accelerationWindowQpc = nowQpc;
+        context.accelerationWindowSpeed = 0.0f;
+        context.hasAccelerationWindowSample = true;
+        context.hasAccelerationWindowSpeed = false;
         return;
     }
 
-    const float dx = static_cast<float>(point.x - g_lastMotionCuePoint.x);
-    const float dy = static_cast<float>(point.y - g_lastMotionCuePoint.y);
+    const float dx = static_cast<float>(point.x - context.lastMotionCuePoint.x);
+    const float dy = static_cast<float>(point.y - context.lastMotionCuePoint.y);
     const float distance = sqrtf(dx * dx + dy * dy);
     const float elapsedSeconds = static_cast<float>(elapsedTicks)
-        / static_cast<float>(std::max<LONGLONG>(1, g_qpcFrequency));
+        / static_cast<float>(std::max<LONGLONG>(1, context.qpcFrequency));
     const float speed = distance / std::max(elapsedSeconds, 0.001f);
     if (distance >= 2.0f) {
         const float directionX = dx / distance;
         const float directionY = dy / distance;
         const LONGLONG turnCooldown = std::max<LONGLONG>(
-            1, g_qpcFrequency * static_cast<LONGLONG>(kTurnAccentCooldownMs) / 1000);
+            1, context.qpcFrequency * static_cast<LONGLONG>(kTurnAccentCooldownMs) / 1000);
 
         const float previousDirectionLength = sqrtf(
-            g_lastMotionDirectionX * g_lastMotionDirectionX
-            + g_lastMotionDirectionY * g_lastMotionDirectionY);
-        if (g_turnAccentEnabled
-            && g_lastMotionCueSpeed >= g_triggerVelocity
-            && speed >= g_triggerVelocity
+            context.lastMotionDirectionX * context.lastMotionDirectionX
+            + context.lastMotionDirectionY * context.lastMotionDirectionY);
+        if (context.turnAccentEnabled
+            && context.lastMotionCueSpeed >= context.triggerVelocity
+            && speed >= context.triggerVelocity
             && previousDirectionLength > 0.5f
-            && (g_lastTurnAccentQpc == 0
-                || nowQpc - g_lastTurnAccentQpc >= turnCooldown)) {
+            && (context.lastTurnAccentQpc == 0
+                || nowQpc - context.lastTurnAccentQpc >= turnCooldown)) {
             const float dot = std::clamp(
-                g_lastMotionDirectionX * directionX + g_lastMotionDirectionY * directionY,
+                context.lastMotionDirectionX * directionX + context.lastMotionDirectionY * directionY,
                 -1.0f,
                 1.0f);
-            if (dot <= g_turnAccentCosThreshold) {
+            if (dot <= context.turnAccentCosThreshold) {
                 AddMotionAccent(
                     point,
                     directionX,
                     directionY,
                     std::clamp((1.0f - dot) * 0.9f, 0.5f, 1.8f),
                     MotionAccentKind::Turn,
-                    g_lastMotionDirectionX,
-                    g_lastMotionDirectionY);
-                g_lastTurnAccentQpc = nowQpc;
+                    context.lastMotionDirectionX,
+                    context.lastMotionDirectionY);
+                context.lastTurnAccentQpc = nowQpc;
             }
         }
 
-        g_lastMotionDirectionX = directionX;
-        g_lastMotionDirectionY = directionY;
+        context.lastMotionDirectionX = directionX;
+        context.lastMotionDirectionY = directionY;
     }
 
     // Compare average velocities over longer, bounded windows instead of differentiating
     // every raw-input wake, whose report batching can make adjacent speeds oscillate.
     const LONGLONG accelerationWindowTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency
+        1, context.qpcFrequency
             * static_cast<LONGLONG>(kAccelerationMeasurementWindowMs) / 1000);
-    if (g_accelerationAccentEnabled
-        && g_hasAccelerationWindowSample
-        && nowQpc - g_accelerationWindowQpc >= accelerationWindowTicks) {
-        const LONGLONG windowElapsedTicks = nowQpc - g_accelerationWindowQpc;
+    if (context.accelerationAccentEnabled
+        && context.hasAccelerationWindowSample
+        && nowQpc - context.accelerationWindowQpc >= accelerationWindowTicks) {
+        const LONGLONG windowElapsedTicks = nowQpc - context.accelerationWindowQpc;
         const float windowElapsedSeconds = static_cast<float>(windowElapsedTicks)
-            / static_cast<float>(std::max<LONGLONG>(1, g_qpcFrequency));
-        const float windowDx = static_cast<float>(point.x - g_accelerationWindowPoint.x);
-        const float windowDy = static_cast<float>(point.y - g_accelerationWindowPoint.y);
+            / static_cast<float>(std::max<LONGLONG>(1, context.qpcFrequency));
+        const float windowDx = static_cast<float>(point.x - context.accelerationWindowPoint.x);
+        const float windowDy = static_cast<float>(point.y - context.accelerationWindowPoint.y);
         const float windowDistance = sqrtf(windowDx * windowDx + windowDy * windowDy);
         const float windowSpeed = windowDistance / std::max(windowElapsedSeconds, 0.001f);
 
-        if (g_hasAccelerationWindowSpeed && windowDistance >= 2.0f) {
+        if (context.hasAccelerationWindowSpeed && windowDistance >= 2.0f) {
             const float acceleration =
-                (windowSpeed - g_accelerationWindowSpeed)
+                (windowSpeed - context.accelerationWindowSpeed)
                 / std::max(windowElapsedSeconds, 0.001f);
             const LONGLONG accelerationCooldown = std::max<LONGLONG>(
-                1, g_qpcFrequency
+                1, context.qpcFrequency
                     * static_cast<LONGLONG>(kAccelerationAccentCooldownMs) / 1000);
-            if (windowSpeed >= g_triggerVelocity
-                && acceleration >= static_cast<float>(g_accelerationThreshold)
-                && (g_lastAccelerationAccentQpc == 0
-                    || nowQpc - g_lastAccelerationAccentQpc >= accelerationCooldown)) {
+            if (windowSpeed >= context.triggerVelocity
+                && acceleration >= static_cast<float>(context.accelerationThreshold)
+                && (context.lastAccelerationAccentQpc == 0
+                    || nowQpc - context.lastAccelerationAccentQpc >= accelerationCooldown)) {
                 const float directionX = windowDx / windowDistance;
                 const float directionY = windowDy / windowDistance;
                 AddMotionAccent(
                     point,
                     directionX,
                     directionY,
-                    acceleration / static_cast<float>(g_accelerationThreshold),
+                    acceleration / static_cast<float>(context.accelerationThreshold),
                     MotionAccentKind::Acceleration);
-                g_lastAccelerationAccentQpc = nowQpc;
+                context.lastAccelerationAccentQpc = nowQpc;
             }
         }
 
-        g_accelerationWindowPoint = point;
-        g_accelerationWindowQpc = nowQpc;
-        g_accelerationWindowSpeed = windowSpeed;
-        g_hasAccelerationWindowSample = true;
-        g_hasAccelerationWindowSpeed = true;
+        context.accelerationWindowPoint = point;
+        context.accelerationWindowQpc = nowQpc;
+        context.accelerationWindowSpeed = windowSpeed;
+        context.hasAccelerationWindowSample = true;
+        context.hasAccelerationWindowSpeed = true;
     }
 
-    g_lastMotionCuePoint = point;
-    g_lastMotionCueQpc = nowQpc;
-    g_lastMotionCueSpeed = speed;
+    context.lastMotionCuePoint = point;
+    context.lastMotionCueQpc = nowQpc;
+    context.lastMotionCueSpeed = speed;
 }
 
 static int UpdateRippleState(LONGLONG nowQpc) {
     const LONGLONG durationTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(g_rippleDurationMs) / 1000);
+        1, context.qpcFrequency * static_cast<LONGLONG>(context.rippleDurationMs) / 1000);
     int activeCount = 0;
-    for (RippleEffect& ripple : g_ripples) {
+    for (RippleEffect& ripple : context.ripples) {
         if (!ripple.active) continue;
         const LONGLONG elapsedTicks = nowQpc - ripple.startQpc;
         if (elapsedTicks >= durationTicks || elapsedTicks < 0) {
@@ -1781,24 +2703,27 @@ static bool HasActiveRipples(LONGLONG nowQpc) {
 static void AddRipple(const POINT& center, uint32_t color, RippleKind kind = RippleKind::Click) {
     int selectedSlot = -1;
     for (int offset = 0; offset < kMaxActiveRipples; ++offset) {
-        const int candidateSlot = (g_nextRippleSlot + offset) % kMaxActiveRipples;
-        if (!g_ripples[candidateSlot].active) {
+        const int candidateSlot = (context.nextRippleSlot + offset) % kMaxActiveRipples;
+        if (!context.ripples[candidateSlot].active) {
             selectedSlot = candidateSlot;
             break;
         }
     }
-    if (selectedSlot < 0) selectedSlot = g_nextRippleSlot;
-    g_nextRippleSlot = (selectedSlot + 1) % kMaxActiveRipples;
+    if (selectedSlot < 0) selectedSlot = context.nextRippleSlot;
+    context.nextRippleSlot = (selectedSlot + 1) % kMaxActiveRipples;
 
-    RippleEffect& ripple = g_ripples[selectedSlot];
+    RippleEffect& ripple = context.ripples[selectedSlot];
     ripple.center = center;
     ripple.startQpc = QpcNow();
     ripple.color = color;
     ripple.kind = kind;
     ripple.active = true;
-    g_interactionPending = true;
-    if (g_inputWakeEvent) SetEvent(g_inputWakeEvent);
+    context.interactionPending = true;
+    if (context.inputWakeEvent) SetEvent(context.inputWakeEvent);
 }
+
+// Raw input registration, integrity levels and polling fallback.
+
 
 static bool RegisterMouseRawInput(HWND hwnd, bool enable) {
     RAWINPUTDEVICE mouse = {};
@@ -1854,8 +2779,8 @@ static bool ReadTokenIntegrityRid(HANDLE tokenHandle, DWORD& integrityRid) {
 }
 
 static void CacheCurrentIntegrityLevel() {
-    if (g_currentIntegrityLevelAttempted) return;
-    g_currentIntegrityLevelAttempted = true;
+    if (context.currentIntegrityLevelAttempted) return;
+    context.currentIntegrityLevelAttempted = true;
 
     HANDLE tokenHandle = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tokenHandle)) {
@@ -1863,10 +2788,10 @@ static void CacheCurrentIntegrityLevel() {
         return;
     }
 
-    g_currentIntegrityLevelKnown =
-        ReadTokenIntegrityRid(tokenHandle, g_currentIntegrityLevelRid);
+    context.currentIntegrityLevelKnown =
+        ReadTokenIntegrityRid(tokenHandle, context.currentIntegrityLevelRid);
     CloseHandle(tokenHandle);
-    if (!g_currentIntegrityLevelKnown) {
+    if (!context.currentIntegrityLevelKnown) {
         Wh_Log(L"Unable to read current process token integrity level");
     }
 }
@@ -1876,7 +2801,7 @@ static void CacheCurrentIntegrityLevel() {
 // target integrity cannot be established safely.
 static bool IsHigherRightsWindow(HWND hwnd) {
     CacheCurrentIntegrityLevel();
-    if (!g_currentIntegrityLevelKnown) return true;
+    if (!context.currentIntegrityLevelKnown) return true;
     if (!hwnd) return false;
 
     DWORD processId = 0;
@@ -1895,7 +2820,7 @@ static bool IsHigherRightsWindow(HWND hwnd) {
     const bool integrityKnown = ReadTokenIntegrityRid(tokenHandle, foregroundIntegrityRid);
     CloseHandle(tokenHandle);
     CloseHandle(processHandle);
-    return !integrityKnown || foregroundIntegrityRid > g_currentIntegrityLevelRid;
+    return !integrityKnown || foregroundIntegrityRid > context.currentIntegrityLevelRid;
 }
 
 static void CALLBACK ForegroundChanged(
@@ -1906,51 +2831,52 @@ static void CALLBACK ForegroundChanged(
     LONG,
     DWORD,
     DWORD) {
-    g_foregroundChangePending = true;
-    if (g_inputWakeEvent) SetEvent(g_inputWakeEvent);
+    context.foregroundChangePending = true;
+    if (context.inputWakeEvent) SetEvent(context.inputWakeEvent);
 }
 
 static void ResetFallbackPollTracking() {
     POINT point = {};
-    g_fallbackCursorPositionValid = GetCursorPos(&point) != FALSE;
-    if (g_fallbackCursorPositionValid) g_fallbackCursorPosition = point;
-    g_fallbackLastMovementTick = GetTickCount() - kFallbackIdleDelayMs;
+    context.fallbackCursorPositionValid = GetCursorPos(&point) != FALSE;
+    if (context.fallbackCursorPositionValid) context.fallbackCursorPosition = point;
+    context.fallbackLastMovementTick = GetTickCount() - kFallbackIdleDelayMs;
 }
 
 static LONGLONG GetFallbackPollIntervalTicks() {
     POINT point = {};
     const DWORD now = GetTickCount();
     if (GetCursorPos(&point)) {
-        if (!g_fallbackCursorPositionValid) {
-            g_fallbackCursorPosition = point;
-            g_fallbackCursorPositionValid = true;
-            g_fallbackLastMovementTick = now - kFallbackIdleDelayMs;
-        } else if (point.x != g_fallbackCursorPosition.x
-            || point.y != g_fallbackCursorPosition.y) {
-            g_fallbackCursorPosition = point;
-            g_fallbackLastMovementTick = now;
+        if (!context.fallbackCursorPositionValid) {
+            context.fallbackCursorPosition = point;
+            context.fallbackCursorPositionValid = true;
+            context.fallbackLastMovementTick = now - kFallbackIdleDelayMs;
+        } else if (point.x != context.fallbackCursorPosition.x
+            || point.y != context.fallbackCursorPosition.y) {
+            context.fallbackCursorPosition = point;
+            context.fallbackLastMovementTick = now;
         }
     }
 
-    const DWORD intervalMs = now - g_fallbackLastMovementTick < kFallbackIdleDelayMs
+    const DWORD intervalMs = now - context.fallbackLastMovementTick < kFallbackIdleDelayMs
         ? kFallbackActivePollIntervalMs
         : kFallbackIdlePollIntervalMs;
     return std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(intervalMs) / 1000);
+        1, context.qpcFrequency * static_cast<LONGLONG>(intervalMs) / 1000);
 }
 
 static void RefreshForegroundInputState() {
-    const bool wasPollingFallback = g_pollingFallback;
-    g_elevatedForeground = IsHigherRightsWindow(GetForegroundWindow());
-    g_pollingFallback = !g_rawInputRegistered || !g_foregroundEventHook || g_elevatedForeground;
-    if (g_pollingFallback && !wasPollingFallback) ResetFallbackPollTracking();
-    g_foregroundChangePending = false;
+    const bool wasPollingFallback = context.pollingFallback;
+    context.elevatedForeground = IsHigherRightsWindow(GetForegroundWindow());
+    context.pollingFallback = !context.rawInputRegistered || !context.foregroundEventHook || context.elevatedForeground;
+    if (context.pollingFallback && !wasPollingFallback) ResetFallbackPollTracking();
+    context.foregroundChangePending = false;
 }
 
-static void ResetAutoColorSamplingCache();
+// Cursor monitor DPI tracking.
+
 
 static bool UpdateCursorMonitorDpi(HMONITOR monitor) {
-    if (!monitor || monitor == g_cursorMonitor) return false;
+    if (!monitor || monitor == context.cursorMonitor) return false;
 
     UINT dpiX = 96;
     UINT dpiY = 96;
@@ -1961,16 +2887,19 @@ static bool UpdateCursorMonitorDpi(HMONITOR monitor) {
         dpiX = 96;
     }
 
-    g_cursorMonitor = monitor;
+    context.cursorMonitor = monitor;
     ResetAutoColorSamplingCache();
     const UINT newDpi = dpiX > 0 ? dpiX : 96;
-    if (newDpi == g_cursorDpi) return false;
+    if (newDpi == context.cursorDpi) return false;
 
-    g_cursorDpi = newDpi;
-    g_currentDpiScale = std::clamp(static_cast<float>(g_cursorDpi) / 96.0f, 0.5f, 4.0f);
+    context.cursorDpi = newDpi;
+    context.currentDpiScale = yoko::win32::DpiScaleForDpi(context.cursorDpi);
     HideOverlay();
     return true;
 }
+
+// Fullscreen detection and suppression state.
+
 
 static bool IsDesktopShellWindow(HWND hwnd) {
     wchar_t className[64] = {};
@@ -1986,7 +2915,8 @@ static bool CoversMonitor(HWND hwnd, HMONITOR cursorMonitor, HMONITOR windowMoni
     RECT windowRect = {};
     if (!GetWindowRect(hwnd, &windowRect)) return false;
     if (!cursorMonitor || windowMonitor != cursorMonitor) return false;
-    MONITORINFO monitorInfo = {sizeof(monitorInfo)};
+    MONITORINFO monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
     if (!GetMonitorInfoW(windowMonitor, &monitorInfo)) return false;
     return windowRect.left <= monitorInfo.rcMonitor.left + kFullscreenTolerancePx
         && windowRect.top <= monitorInfo.rcMonitor.top + kFullscreenTolerancePx
@@ -2011,22 +2941,22 @@ static bool IsFullscreenCandidate(
 
     if (!cursorMonitor || windowMonitor != cursorMonitor) return false;
 
-    if (hwnd != g_fullscreenForegroundWindow) {
-        g_fullscreenForegroundWindow = hwnd;
-        g_lastFullscreenStrongCheck = 0;
-        g_fullscreenStrongSignal = false;
-        g_fullscreenCoversMonitor = false;
-        g_fullscreenFalseSince = 0;
+    if (hwnd != context.fullscreenForegroundWindow) {
+        context.fullscreenForegroundWindow = hwnd;
+        context.lastFullscreenStrongCheck = 0;
+        context.fullscreenStrongSignal = false;
+        context.fullscreenCoversMonitor = false;
+        context.fullscreenFalseSince = 0;
     }
 
     // Window geometry and the shell's D3D state do not need to be queried on
     // every input report, even though fullscreen transitions are event-driven.
-    if (now - g_lastFullscreenStrongCheck >= kFullscreenStrongCheckIntervalMs) {
-        g_lastFullscreenStrongCheck = now;
-        g_fullscreenStrongSignal = CheckStrongFullscreenSignal();
-        g_fullscreenCoversMonitor = CoversMonitor(hwnd, cursorMonitor, windowMonitor);
+    if (now - context.lastFullscreenStrongCheck >= kFullscreenStrongCheckIntervalMs) {
+        context.lastFullscreenStrongCheck = now;
+        context.fullscreenStrongSignal = CheckStrongFullscreenSignal();
+        context.fullscreenCoversMonitor = CoversMonitor(hwnd, cursorMonitor, windowMonitor);
     }
-    return g_fullscreenStrongSignal || g_fullscreenCoversMonitor;
+    return context.fullscreenStrongSignal || context.fullscreenCoversMonitor;
 }
 
 static bool UpdateFullscreenState(DWORD now, HWND foreground, HMONITOR cursorMonitor) {
@@ -2045,564 +2975,356 @@ static bool UpdateFullscreenState(DWORD now, HWND foreground, HMONITOR cursorMon
     // These transitions are immediate; ordinary same-monitor fullscreen exit
     // still uses the 500 ms confirmation below to avoid flicker.
     if (isDesktopShell || pointerLeftFullscreenMonitor) {
-        g_fullscreenSuppressed = false;
-        g_fullscreenFalseSince = 0;
+        context.fullscreenSuppressed = false;
+        context.fullscreenFalseSince = 0;
         return false;
     }
 
     const bool candidate = IsFullscreenCandidate(
         now, foreground, cursorMonitor, foregroundMonitor);
     if (candidate) {
-        g_fullscreenFalseSince = 0;
-        g_fullscreenSuppressed = true;
+        context.fullscreenFalseSince = 0;
+        context.fullscreenSuppressed = true;
         return true;
     }
 
-    if (g_fullscreenSuppressed) {
-        if (g_fullscreenFalseSince == 0) g_fullscreenFalseSince = now;
-        if (now - g_fullscreenFalseSince >= kFullscreenExitConfirmMs) {
-            g_fullscreenSuppressed = false;
-            g_fullscreenFalseSince = 0;
+    if (context.fullscreenSuppressed) {
+        if (context.fullscreenFalseSince == 0) context.fullscreenFalseSince = now;
+        if (now - context.fullscreenFalseSince >= kFullscreenExitConfirmMs) {
+            context.fullscreenSuppressed = false;
+            context.fullscreenFalseSince = 0;
         }
-        return g_fullscreenSuppressed;
+        return context.fullscreenSuppressed;
     }
 
-    g_fullscreenFalseSince = 0;
+    context.fullscreenFalseSince = 0;
     return false;
 }
 
-static int GrowBackbufferDimension(int required, int current) {
-    if (required <= current) return current;
+// Per-application enable and disable rules.
 
-    const int64_t rounded = (
-        (static_cast<int64_t>(required) + kBackbufferGrowthGranularity - 1)
-        / kBackbufferGrowthGranularity
-    ) * kBackbufferGrowthGranularity;
-    return rounded <= std::numeric_limits<int>::max()
-        ? static_cast<int>(rounded)
-        : required;
+
+static bool GetProcessExeName(DWORD pid, std::wstring& out) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    WCHAR path[512] = {};
+    DWORD size = ARRAYSIZE(path);
+    const BOOL success = QueryFullProcessImageNameW(process, 0, path, &size);
+    CloseHandle(process);
+    if (!success) return false;
+    const wchar_t* name = wcsrchr(path, L'\\');
+    out = ToLowerW(name ? name + 1 : path);
+    return true;
 }
 
-// Growing swaps in a fresh DC and DIB, then rebinds the existing Direct2D
-// target instead of rebuilding every brush, layer, and device bitmap. The new
-// surface is built first, so the old one stays usable if anything fails.
-static bool SwapBackbufferSurface(int newWidth, int newHeight, HDC referenceDc) {
-    HDC newDc = CreateCompatibleDC(referenceDc);
-    if (!newDc) return false;
-    HBITMAP newBitmap = Create32BitDIB(newWidth, newHeight);
-    if (!newBitmap) {
-        DeleteDC(newDc);
-        return false;
-    }
-    const HGDIOBJ newOriginalBitmap = SelectObject(newDc, newBitmap);
-    if (!newOriginalBitmap || newOriginalBitmap == HGDI_ERROR) {
-        DeleteObject(newBitmap);
-        DeleteDC(newDc);
-        return false;
-    }
+static void ParseAppRuleEntry(const wchar_t* text) {
+    if (!text) return;
 
-    if (g_renderTarget) {
-        const RECT bindRect = {0, 0, newWidth, newHeight};
-        if (FAILED(g_renderTarget->BindDC(newDc, &bindRect))) {
-            // A failed rebind leaves the old binding in an unknown state, so
-            // rebuild the target on the next frame and keep the new surface.
-            ReleaseRenderResources();
-        } else {
-            g_dcBound = true;
+    std::wstring ruleText(text);
+    const size_t comment = ruleText.find(L'#');
+    if (comment != std::wstring::npos) ruleText.resize(comment);
+    const size_t equals = ruleText.find(L'=');
+    if (equals == std::wstring::npos) return;
+
+    std::wstring exe = ruleText.substr(0, equals);
+    std::wstring value = ruleText.substr(equals + 1);
+    const auto trim = [](std::wstring& item) {
+        const size_t first = item.find_first_not_of(L" \t");
+        if (first == std::wstring::npos) {
+            item.clear();
+            return;
+        }
+        const size_t last = item.find_last_not_of(L" \t");
+        item = item.substr(first, last - first + 1);
+    };
+    trim(exe);
+    trim(value);
+
+    const bool enabled = _wcsicmp(value.c_str(), L"on") == 0
+        || value == L"1"
+        || _wcsicmp(value.c_str(), L"true") == 0
+        || _wcsicmp(value.c_str(), L"yes") == 0;
+    const bool disabled = _wcsicmp(value.c_str(), L"off") == 0
+        || value == L"0"
+        || _wcsicmp(value.c_str(), L"false") == 0
+        || _wcsicmp(value.c_str(), L"no") == 0;
+    if (!exe.empty() && (enabled || disabled)) {
+        context.appRules.push_back({ToLowerW(exe), enabled});
+    }
+}
+
+static void ParseAppRules() {
+    context.appRules.clear();
+
+    constexpr int kMaxAppRuleEntries = 64;
+    int consecutiveEmptyEntries = 0;
+    for (int index = 0; index < kMaxAppRuleEntries; ++index) {
+        WindhawkUtils::StringSetting setting =
+            WindhawkUtils::StringSetting::make(L"Application.app_rules[%d]", index);
+        const wchar_t* value = setting.get();
+        if (!value || !*value) {
+            if (++consecutiveEmptyEntries >= 2) break;
+            continue;
+        }
+
+        consecutiveEmptyEntries = 0;
+        ParseAppRuleEntry(value);
+    }
+}
+
+static int CheckAppRuleCached(HWND foreground) {
+    if (foreground == context.cachedForegroundWindow) return context.cachedAppRule;
+    context.cachedForegroundWindow = foreground;
+    context.cachedAppRule = 0;
+    if (!foreground || context.appRules.empty()) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    if (!pid) return 0;
+    std::wstring exe;
+    if (!GetProcessExeName(pid, exe)) return 0;
+    for (const auto& rule : context.appRules) {
+        if (wcscmp(rule.exe.c_str(), exe.c_str()) == 0) {
+            context.cachedAppRule = rule.enabled ? 1 : -1;
+            break;
         }
     }
-
-    HDC oldDc = g_backBufferDc;
-    HBITMAP oldBitmap = g_backBufferBitmap;
-    HGDIOBJ oldOriginalBitmap = g_originalBitmap;
-    g_backBufferDc = newDc;
-    g_backBufferBitmap = newBitmap;
-    g_originalBitmap = newOriginalBitmap;
-    if (oldDc) {
-        if (oldOriginalBitmap) SelectObject(oldDc, oldOriginalBitmap);
-        DeleteDC(oldDc);
-    }
-    if (oldBitmap) DeleteObject(oldBitmap);
-    return true;
+    return context.cachedAppRule;
 }
 
-bool EnsureBackbuffer(int width, int height, HDC referenceDc) {
-    if (width <= 0 || height <= 0 || !referenceDc) return false;
-    if (g_backBufferDc && g_backBufferBitmap && width <= g_cachedWidth && height <= g_cachedHeight) return true;
-    const int newWidth = GrowBackbufferDimension(width, g_cachedWidth);
-    const int newHeight = GrowBackbufferDimension(height, g_cachedHeight);
-    if (!SwapBackbufferSurface(newWidth, newHeight, referenceDc)) return false;
-    g_cachedWidth = newWidth;
-    g_cachedHeight = newHeight;
-    g_backbufferIdleSince = 0;
-    return true;
-}
+// Ornament preset selection and image specification parsing.
 
-static void MaybeReleaseIdleBackbuffer(DWORD now, LONGLONG nowQpc) {
-    if (g_isSmearing || g_historyCount > 0 || HasActiveRipples(nowQpc) || OrnamentActive()) {
-        g_backbufferIdleSince = 0;
+
+static void TrimOrnamentText(std::wstring& text) {
+    const size_t first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) {
+        text.clear();
         return;
     }
-    if (!g_backBufferDc || !g_backBufferBitmap) {
-        g_backbufferIdleSince = 0;
-        return;
-    }
-    if (g_backbufferIdleSince == 0) {
-        g_backbufferIdleSince = now;
-        return;
-    }
-    if (now - g_backbufferIdleSince >= kBackbufferIdleReleaseDelayMs) {
-        ReleaseBackbuffer();
-    }
+    const size_t last = text.find_last_not_of(L" \t\r\n");
+    text = text.substr(first, last - first + 1);
 }
 
-bool EnsureD2DResources() {
-    if (!g_d2dFactory) return false;
-    if (g_renderTarget) return true;
-    const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    HRESULT hr = g_d2dFactory->CreateDCRenderTarget(&properties, &g_renderTarget);
-    if (FAILED(hr) || !g_renderTarget) return false;
-    hr = g_renderTarget->CreateSolidColorBrush(ToColorF(g_currentOuterRGB, 1.0f), &g_outerBrush);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    hr = g_renderTarget->CreateSolidColorBrush(ToColorF(g_currentCoreRGB, 1.0f), &g_coreBrush);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    hr = g_renderTarget->CreateSolidColorBrush(ToColorF(g_glowRGB, 1.0f), &g_glowBrush);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    g_outerBrushColorCache = g_currentOuterRGB;
-    g_coreBrushColorCache = g_currentCoreRGB;
-    g_glowBrushColorCache = g_glowRGB;
-    hr = g_renderTarget->CreateLayer(nullptr, &g_trailOpacityLayer);
-    if (FAILED(hr) || !g_trailOpacityLayer) { ReleaseRenderResources(); return false; }
-    hr = g_renderTarget->CreateLayer(nullptr, &g_glowOpacityLayer);
-    if (FAILED(hr) || !g_glowOpacityLayer) { ReleaseRenderResources(); return false; }
-    hr = g_renderTarget->CreateSolidColorBrush(ToColorF(g_leftClickRGB, 1.0f), &g_rippleBrush);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    hr = g_renderTarget->CreateSolidColorBrush(ToColorF(g_currentCoreRGB, 1.0f), &g_ornamentBrush);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    D2D1_STROKE_STYLE_PROPERTIES strokeProperties = {};
-    strokeProperties.startCap = D2D1_CAP_STYLE_ROUND;
-    strokeProperties.endCap = D2D1_CAP_STYLE_ROUND;
-    strokeProperties.lineJoin = D2D1_LINE_JOIN_ROUND;
-    hr = g_d2dFactory->CreateStrokeStyle(strokeProperties, nullptr, 0, &g_strokeStyle);
-    if (FAILED(hr)) { ReleaseRenderResources(); return false; }
-    return true;
+static bool LooksLikeOrnamentPath(const std::wstring& text) {
+    return text.find(L'\\') != std::wstring::npos
+        || text.find(L'/') != std::wstring::npos
+        || text.find(L':') != std::wstring::npos;
 }
 
-bool EnsureGradientBrush() {
-    if (!g_gradientEnabled) {
-        if (g_gradientBrush) { g_gradientBrush->Release(); g_gradientBrush = nullptr; }
-        if (g_gradientStops) { g_gradientStops->Release(); g_gradientStops = nullptr; }
-        g_gradientHeadCache = 0xFFFFFFFFu;
-        g_gradientTailCache = 0xFFFFFFFFu;
-        return false;
-    }
-    if (!g_renderTarget) return false;
-    if (g_gradientBrush && g_gradientStops && g_gradientHeadCache == g_currentCoreRGB && g_gradientTailCache == g_gradientTailRGB) return true;
-    if (g_gradientBrush) { g_gradientBrush->Release(); g_gradientBrush = nullptr; }
-    if (g_gradientStops) { g_gradientStops->Release(); g_gradientStops = nullptr; }
-    D2D1_GRADIENT_STOP stops[2] = {};
-    stops[0].position = 0.0f;
-    stops[0].color = ToColorF(g_currentCoreRGB, 1.0f);
-    stops[1].position = 1.0f;
-    stops[1].color = ToColorF(g_gradientTailRGB, 1.0f);
-    HRESULT hr = g_renderTarget->CreateGradientStopCollection(stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &g_gradientStops);
-    if (FAILED(hr)) return false;
-    const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES properties = {};
-    hr = g_renderTarget->CreateLinearGradientBrush(properties, g_gradientStops, &g_gradientBrush);
-    if (FAILED(hr)) { g_gradientStops->Release(); g_gradientStops = nullptr; return false; }
-    g_gradientHeadCache = g_currentCoreRGB;
-    g_gradientTailCache = g_gradientTailRGB;
-    return true;
-}
-
-void SmoothTrail(int iterations, int renderLength) {
-    D2D1_POINT_2F* current = g_renderCache.pointsA;
-    D2D1_POINT_2F* next = g_renderCache.pointsB;
-    const int pointCount = std::min(g_historyCount, std::max(renderLength, 2));
-    int currentCount = 0;
-    const float offsetX = static_cast<float>(g_tailOffsetX) * g_currentDpiScale;
-    const float offsetY = static_cast<float>(g_tailOffsetY) * g_currentDpiScale;
-    for (int i = 0; i < pointCount; ++i) {
-        const POINT& point = HistoryAt(i);
-        current[currentCount++] = D2D1::Point2F(
-            static_cast<float>(point.x) + offsetX,
-            static_cast<float>(point.y) + offsetY);
-    }
-    const int iterationLimit = std::clamp(
-        iterations, 0, kMaxSmoothIterations);
-    for (int iteration = 0; iteration < iterationLimit && currentCount >= 3;
-         ++iteration) {
-        if (currentCount > kMaxTrailRenderPoints / 2) break;
-        int nextCount = 0;
-        next[nextCount++] = current[0];
-        for (int i = 0; i + 1 < currentCount; ++i) {
-            const D2D1_POINT_2F& a = current[i];
-            const D2D1_POINT_2F& b = current[i + 1];
-            next[nextCount++] = D2D1::Point2F(
-                0.75f * a.x + 0.25f * b.x,
-                0.75f * a.y + 0.25f * b.y);
-            next[nextCount++] = D2D1::Point2F(
-                0.25f * a.x + 0.75f * b.x,
-                0.25f * a.y + 0.75f * b.y);
-        }
-        next[nextCount++] = current[currentCount - 1];
-        currentCount = nextCount;
-        D2D1_POINT_2F* swap = current;
-        current = next;
-        next = swap;
-    }
-    g_renderCache.activePoints = current;
-    g_renderCache.pointCount = currentCount;
-    ++g_renderCache.generation;
-    g_renderCache.PrepareTaper();
-}
-
-RECT CalculateTrailBounds(float maxHalfWidth) {
-    const int pointCount = g_renderCache.pointCount;
-    if (pointCount <= 0) return {0, 0, 0, 0};
-    const D2D1_POINT_2F* points = g_renderCache.activePoints;
-    float minX = points[0].x;
-    float minY = points[0].y;
-    float maxX = minX;
-    float maxY = minY;
-    for (int i = 1; i < pointCount; ++i) {
-        const D2D1_POINT_2F& point = points[i];
-        minX = std::min(minX, point.x);
-        minY = std::min(minY, point.y);
-        maxX = std::max(maxX, point.x);
-        maxY = std::max(maxY, point.y);
-    }
-    const float padding = maxHalfWidth + kRenderPadding;
-    RECT result = {
-        static_cast<LONG>(floorf(minX - padding)),
-        static_cast<LONG>(floorf(minY - padding)),
-        static_cast<LONG>(ceilf(maxX + padding)),
-        static_cast<LONG>(ceilf(maxY + padding)),
-    };
-    if (result.right <= result.left) result.right = result.left + 1;
-    if (result.bottom <= result.top) result.bottom = result.top + 1;
-    return result;
-}
-
-static void DrawTrailStroke(ID2D1RenderTarget* target, ID2D1Brush* brush, float halfWidth, bool drawHead) {
-    const int pointCount = g_renderCache.pointCount;
-    const D2D1_POINT_2F* points = g_renderCache.activePoints;
-    const float* taper = g_renderCache.taper;
-    if (pointCount < 2 || !brush) return;
-    for (int i = 0; i + 1 < pointCount; ++i) {
-        const float width = std::max(0.1f, halfWidth * taper[i] * 2.0f);
-        target->DrawLine(points[i], points[i + 1], brush, width, g_strokeStyle);
-    }
-    if (drawHead) target->FillEllipse(D2D1::Ellipse(points[0], halfWidth, halfWidth), brush);
-}
-
-// The ribbon submits one closed outline per layer: side one, a round tail cap,
-// then side two. The head stays a separate ellipse, which keeps the original
-// rounded head exactly. A single fill replaces a stroke per trail segment, and
-// the winding fill mode keeps self-crossing trails filled as one shape.
-// A reversing turn folds the outline instead of reaching the round tip of the
-// stroke join it replaced, so those interior centers get a disk of at most the
-// local half width after the fill.
-//
-// Center decimation, taper sampling, and normals depend only on the smoothed
-// trail, so they are computed once per generation and shared by all layers.
-// Only the half width scaling and the outline points vary per layer.
-struct TrailRibbonCache {
-    D2D1_POINT_2F centers[kTrailRibbonMaxCenterPoints] = {};
-    float normalX[kTrailRibbonMaxCenterPoints] = {};
-    float normalY[kTrailRibbonMaxCenterPoints] = {};
-    float taper[kTrailRibbonMaxCenterPoints] = {};
-    bool roundJoin[kTrailRibbonMaxCenterPoints] = {};
-    int centerCount = 0;
-    int generation = 0;
-    bool valid = false;
-};
-
-TrailRibbonCache g_ribbonCache;
-D2D1_POINT_2F g_ribbonOutline[kTrailRibbonMaxOutlinePoints] = {};
-
-static int EnsureTrailRibbon() {
-    if (g_ribbonCache.valid &&
-        g_ribbonCache.generation == g_renderCache.generation) {
-        return g_ribbonCache.centerCount;
-    }
-    g_ribbonCache.valid = true;
-    g_ribbonCache.generation = g_renderCache.generation;
-    g_ribbonCache.centerCount = 0;
-    const int total = g_renderCache.pointCount;
-    if (total < 2) return 0;
-
-    const D2D1_POINT_2F* points = g_renderCache.activePoints;
-    const float* taper = g_renderCache.taper;
-    const int last = total - 1;
-    const float minSpacingSq =
-        kTrailRibbonMinSpacingPx * kTrailRibbonMinSpacingPx;
-    const auto taperAt = [taper, last](int index) {
-        if (index <= 0) return taper[0];
-        if (index >= last) return taper[last - 1];
-        return (taper[index - 1] + taper[index]) * 0.5f;
-    };
-    const auto store = [](int index, D2D1_POINT_2F point, float width) {
-        g_ribbonCache.centers[index] = point;
-        g_ribbonCache.taper[index] = width;
-    };
-
-    int count = 0;
-    store(count++, points[0], taper[0]);
-    int step = (last + kTrailRibbonMaxCenterPoints - 2) /
-               (kTrailRibbonMaxCenterPoints - 1);
-    if (step < 1) step = 1;
-    for (int index = step;
-         index < last && count < kTrailRibbonMaxCenterPoints - 1;
-         index += step) {
-        const D2D1_POINT_2F& previous = g_ribbonCache.centers[count - 1];
-        const float dx = points[index].x - previous.x;
-        const float dy = points[index].y - previous.y;
-        if (dx * dx + dy * dy < minSpacingSq) continue;
-        store(count++, points[index], taperAt(index));
-    }
-
-    // The tail must stay exact so the visible taper ends at the last sample.
-    // A near-duplicate tail replaces the previous center instead of adding a
-    // zero-length segment whose direction would be undefined.
-    const D2D1_POINT_2F& previous = g_ribbonCache.centers[count - 1];
-    const float tailDx = points[last].x - previous.x;
-    const float tailDy = points[last].y - previous.y;
-    if (count == 1 || tailDx * tailDx + tailDy * tailDy >= minSpacingSq) {
-        store(count++, points[last], taperAt(last));
-    } else {
-        store(count - 1, points[last], taperAt(last));
-    }
-
-    float lastDirX = 1.0f;
-    float lastDirY = 0.0f;
-    bool directionKnown = false;
-    for (int i = 0; i < count; ++i) {
-        float previousX = 0.0f;
-        float previousY = 0.0f;
-        float nextX = 0.0f;
-        float nextY = 0.0f;
-        if (i > 0) {
-            previousX = g_ribbonCache.centers[i].x - g_ribbonCache.centers[i - 1].x;
-            previousY = g_ribbonCache.centers[i].y - g_ribbonCache.centers[i - 1].y;
-        }
-        if (i + 1 < count) {
-            nextX = g_ribbonCache.centers[i + 1].x - g_ribbonCache.centers[i].x;
-            nextY = g_ribbonCache.centers[i + 1].y - g_ribbonCache.centers[i].y;
-        }
-        const float dirX = previousX + nextX;
-        const float dirY = previousY + nextY;
-        const float lengthSq = dirX * dirX + dirY * dirY;
-        if (lengthSq > 1.0e-8f) {
-            const float inverseLength = 1.0f / sqrtf(lengthSq);
-            lastDirX = dirX * inverseLength;
-            lastDirY = dirY * inverseLength;
-            directionKnown = true;
-        } else if (!directionKnown) {
-            // A stationary prefix repeats one point. Look ahead once for the
-            // first real segment so the whole prefix shares its normal.
-            for (int next = i + 1; next < count; ++next) {
-                const float forwardX =
-                    g_ribbonCache.centers[next].x - g_ribbonCache.centers[i].x;
-                const float forwardY =
-                    g_ribbonCache.centers[next].y - g_ribbonCache.centers[i].y;
-                const float forwardLengthSq = forwardX * forwardX + forwardY * forwardY;
-                if (forwardLengthSq <= 1.0e-8f) continue;
-                const float inverseLength = 1.0f / sqrtf(forwardLengthSq);
-                lastDirX = forwardX * inverseLength;
-                lastDirY = forwardY * inverseLength;
-                directionKnown = true;
-                break;
+// Preset keys are matched case-insensitively. An unknown value falls back to
+// the first preset so a stale or hand-edited key still renders something.
+static OrnamentPreset ParseOrnamentPreset(const wchar_t* value) {
+    if (value && *value) {
+        for (size_t i = 0; i < _countof(kOrnamentPresets); ++i) {
+            if (_wcsicmp(kOrnamentPresets[i].key, value) == 0) {
+                return static_cast<OrnamentPreset>(i);
             }
         }
-        // The averaged unit direction keeps every offset at or below the half
-        // width, so the trail bounds never need to grow for a miter spike.
-        g_ribbonCache.normalX[i] = -lastDirY;
-        g_ribbonCache.normalY[i] = lastDirX;
-        // Zero-length sides only occur at the endpoints, which the head ellipse
-        // and the tail cap already round, so this marks interior reversals only.
-        g_ribbonCache.roundJoin[i] =
-            previousX * previousX + previousY * previousY > 1.0e-8f &&
-            nextX * nextX + nextY * nextY > 1.0e-8f &&
-            previousX * nextX + previousY * nextY < 0.0f;
     }
-
-    g_ribbonCache.centerCount = count;
-    return count;
+    return OrnamentPreset::Classic;
 }
 
-static int BuildTrailRibbonOutline(float halfWidth) {
-    const int count = EnsureTrailRibbon();
-    if (count < 2) return 0;
-    const D2D1_POINT_2F* centers = g_ribbonCache.centers;
-    D2D1_POINT_2F* outline = g_ribbonOutline;
-    int outCount = 0;
-    for (int i = 0; i < count; ++i) {
-        const float scaled = halfWidth * g_ribbonCache.taper[i];
-        const float width =
-            scaled > kTrailRibbonMinHalfWidth ? scaled : kTrailRibbonMinHalfWidth;
-        outline[outCount++] = D2D1::Point2F(
-            centers[i].x + g_ribbonCache.normalX[i] * width,
-            centers[i].y + g_ribbonCache.normalY[i] * width);
+// The legacy `Ornament.images[0]` entry is read only when the new single-image
+// setting is empty, so an upgrading user keeps the pendant they configured.
+static void LoadOrnamentImageSpec() {
+    context.ornamentImageSpecs.clear();
+    std::wstring path;
+    WindhawkUtils::StringSetting imageSetting =
+        WindhawkUtils::StringSetting::make(L"Ornament.image");
+    if (imageSetting.get()) path = imageSetting.get();
+    TrimOrnamentText(path);
+    if (path.empty()) {
+        WindhawkUtils::StringSetting legacySetting =
+            WindhawkUtils::StringSetting::make(L"Ornament.images[0]");
+        if (legacySetting.get()) {
+            std::wstring entry = legacySetting.get();
+            TrimOrnamentText(entry);
+            const size_t equals = entry.find(L'=');
+            if (equals != std::wstring::npos) {
+                std::wstring candidateId = entry.substr(0, equals);
+                std::wstring candidatePath = entry.substr(equals + 1);
+                TrimOrnamentText(candidateId);
+                TrimOrnamentText(candidatePath);
+                if (!candidatePath.empty() && !LooksLikeOrnamentPath(candidateId)) {
+                    entry = std::move(candidatePath);
+                }
+            }
+            TrimOrnamentText(entry);
+            path = std::move(entry);
+        }
     }
-    const int tail = count - 1;
-    const float tailWidth = halfWidth * g_ribbonCache.taper[tail];
-    const float tailRadius =
-        tailWidth > kTrailRibbonMinHalfWidth ? tailWidth : kTrailRibbonMinHalfWidth;
-    const float normalX = g_ribbonCache.normalX[tail];
-    const float normalY = g_ribbonCache.normalY[tail];
-    // The stored normal is the left offset, so the travel direction is the
-    // normal rotated to the right. The cap bulges along that direction.
-    const float capX = normalY;
-    const float capY = -normalX;
-    for (int step = 0; step < kTrailRibbonCapSegments - 1; ++step) {
-        const float cosine = kTrailRibbonCapCos[step] * tailRadius;
-        const float sine = kTrailRibbonCapSin[step] * tailRadius;
-        outline[outCount++] = D2D1::Point2F(
-            centers[tail].x + normalX * cosine + capX * sine,
-            centers[tail].y + normalY * cosine + capY * sine);
-    }
-    for (int i = tail; i >= 0; --i) {
-        const float scaled = halfWidth * g_ribbonCache.taper[i];
-        const float width =
-            scaled > kTrailRibbonMinHalfWidth ? scaled : kTrailRibbonMinHalfWidth;
-        outline[outCount++] = D2D1::Point2F(
-            centers[i].x - g_ribbonCache.normalX[i] * width,
-            centers[i].y - g_ribbonCache.normalY[i] * width);
-    }
-    return outCount;
+    if (path.empty()) return;
+    OrnamentImageSpec spec;
+    spec.id = L"pendant";
+    spec.path = std::move(path);
+    context.ornamentImageSpecs.push_back(std::move(spec));
 }
 
-static bool FillTrailRibbon(
-    ID2D1RenderTarget* target,
-    ID2D1Brush* brush,
-    float halfWidth) {
-    if (!target || !brush) return false;
-    const int outlineCount = BuildTrailRibbonOutline(halfWidth);
-    if (outlineCount < 3) return false;
-    ID2D1PathGeometry* geometry = nullptr;
-    if (FAILED(g_d2dFactory->CreatePathGeometry(&geometry)) || !geometry) {
-        return false;
+// The selected preset owns the anchor, physics, reaction impulses, and node
+// layout. Nodes always exist, so an empty image still renders the circular
+// fallback of the draw path.
+static void ApplyOrnamentPreset(OrnamentPreset preset) {
+    const OrnamentPresetDefinition& definition =
+        kOrnamentPresets[static_cast<size_t>(preset)];
+    context.ornamentAnchorOffsetX = definition.anchorOffsetX;
+    context.ornamentAnchorOffsetY = definition.anchorOffsetY;
+    context.ornamentGravity = definition.gravity;
+    context.ornamentDamping = definition.damping;
+    context.ornamentConstraintIterations = definition.constraintIterations;
+    context.ornamentStretch = definition.stretch;
+    context.ornamentOpacity = definition.opacity;
+    context.ornamentClickImpulse = definition.clickImpulse;
+    context.ornamentWheelImpulse = definition.wheelImpulse;
+    context.ornamentRopeSegments = definition.ropeSegments;
+    context.ornamentRopeLengthPx = definition.ropeLengthPx * context.ornamentRopeLengthScale;
+    context.ornamentRopeStyle = definition.ropeStyle;
+    context.ornamentRopeWidthPx = definition.ropeWidthPx;
+    context.ornamentRopeOpacity = definition.ropeOpacity;
+
+    context.ornamentNodeSpecs.clear();
+    const int nodeCount = std::clamp(definition.nodeCount, 0, kOrnamentMaxPresetNodes);
+    context.ornamentNodeSpecs.reserve(static_cast<size_t>(nodeCount));
+    for (int i = 0; i < nodeCount; ++i) {
+        const OrnamentPresetNode& presetNode = definition.nodes[i];
+        OrnamentNodeSpec spec;
+        if (!context.ornamentImageSpecs.empty()) {
+            spec.imageId = context.ornamentImageSpecs.front().id;
+        }
+        spec.ropeT = presetNode.ropeT;
+        spec.sizePx = presetNode.sizePx;
+        spec.opacity = presetNode.opacity;
+        spec.angleDegrees = presetNode.angleDegrees;
+        context.ornamentNodeSpecs.push_back(std::move(spec));
     }
-    ID2D1GeometrySink* sink = nullptr;
-    if (FAILED(geometry->Open(&sink)) || !sink) {
-        geometry->Release();
-        return false;
-    }
-    sink->SetFillMode(D2D1_FILL_MODE_WINDING);
-    sink->BeginFigure(g_ribbonOutline[0], D2D1_FIGURE_BEGIN_FILLED);
-    for (int i = 1; i < outlineCount; ++i) sink->AddLine(g_ribbonOutline[i]);
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    const HRESULT hr = sink->Close();
-    sink->Release();
-    if (FAILED(hr)) {
-        geometry->Release();
-        return false;
-    }
-    target->FillGeometry(geometry, brush);
-    geometry->Release();
-    const int centerCount = g_ribbonCache.centerCount;
-    for (int i = 1; i + 1 < centerCount; ++i) {
-        if (!g_ribbonCache.roundJoin[i]) continue;
-        float radius = halfWidth * g_ribbonCache.taper[i];
-        if (radius < kTrailRibbonMinHalfWidth) radius = kTrailRibbonMinHalfWidth;
-        if (radius > halfWidth) radius = halfWidth;
-        if (radius <= 0.0f) continue;
-        target->FillEllipse(
-            D2D1::Ellipse(g_ribbonCache.centers[i], radius, radius), brush);
-    }
-    return true;
 }
 
-static void DrawTrailLayer(
-    ID2D1RenderTarget* target,
-    ID2D1Brush* brush,
-    float halfWidth) {
-    if (FillTrailRibbon(target, brush, halfWidth)) {
-        const D2D1_POINT_2F& head = g_ribbonCache.centers[0];
-        target->FillEllipse(
-            D2D1::Ellipse(head, halfWidth, halfWidth), brush);
-        return;
-    }
-    DrawTrailStroke(target, brush, halfWidth, true);
-}
+// Settings loading and the settings-changed application path.
 
-static int GetEffectiveTailLength(float speedNorm) {
-    if (!g_speedScaling) return g_tailLength;
-    return std::max(2, static_cast<int>(g_tailLength * (0.55f + 0.45f * std::clamp(speedNorm, 0.0f, 1.0f))));
-}
 
-void UpdateTrailState(const POINT& previousPoint, const POINT& point, float velocity) {
-    const bool startedSmearing = velocity > g_triggerVelocity && !g_isSmearing;
-    if (startedSmearing) {
-        g_isSmearing = true;
-        g_lowVelocityFrames = 0;
-        g_fadeAlpha = 1.0f;
-        g_smoothedSpeedNorm = 0.0f;
-    } else if (velocity < g_stopVelocity && g_isSmearing) {
-        if (++g_lowVelocityFrames > 2) {
-            g_isSmearing = false;
-            g_frozenSpeedNorm = g_smoothedSpeedNorm;
-        }
-    } else if (g_isSmearing) {
-        g_lowVelocityFrames = 0;
+void LoadSettings() {
+    context.triggerVelocity = static_cast<float>(yoko::GetClampedIntSetting(L"Behavior.trigger_velocity", 50, 20000));
+    context.stopVelocity = static_cast<float>(yoko::GetClampedIntSetting(L"Behavior.stop_velocity", 50, 20000));
+    if (context.stopVelocity >= context.triggerVelocity) context.stopVelocity = std::max(50.0f, context.triggerVelocity * 0.5f);
+    context.tailOffsetX = yoko::GetClampedIntSetting(L"Behavior.tail_offset_x", -64, 64);
+    context.tailOffsetY = yoko::GetClampedIntSetting(L"Behavior.tail_offset_y", -64, 64);
+    context.tailLength = yoko::GetClampedIntSetting(L"Behavior.tail_length", 2, kMaxTailLength);
+    context.speedScaling = yoko::GetClampedIntSetting(L"Behavior.speed_scaling", 0, 1);
+    context.widthMin = static_cast<float>(yoko::GetClampedIntSetting(L"Appearance.width_min", 1, 40));
+    context.widthMax = static_cast<float>(yoko::GetClampedIntSetting(L"Appearance.width_max", 1, 60));
+    context.coreWidthMin = static_cast<float>(yoko::GetClampedIntSetting(L"Appearance.core_width_min", 1, 40));
+    context.coreWidthMax = static_cast<float>(yoko::GetClampedIntSetting(L"Appearance.core_width_max", 1, 60));
+    context.alphaMin = yoko::GetClampedIntSetting(L"Appearance.alpha_min", 0, 100) / 100.0f;
+    context.alphaMax = yoko::GetClampedIntSetting(L"Appearance.alpha_max", 0, 100) / 100.0f;
+    context.taperPowerIndex = yoko::GetClampedIntSetting(L"Appearance.taper_power", kTaperPowerSettingMin, kTaperPowerSettingMax);
+    if (context.widthMax < context.widthMin) std::swap(context.widthMin, context.widthMax);
+    if (context.coreWidthMax < context.coreWidthMin) std::swap(context.coreWidthMin, context.coreWidthMax);
+    context.smoothIterations = yoko::GetClampedIntSetting(L"Appearance.smooth_iterations", 0, kMaxSmoothIterations);
+    context.gradientEnabled = yoko::GetClampedIntSetting(L"Effects.gradient_enabled", 0, 1);
+    {
+        uint32_t parsed = 0;
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Effects.gradient_tail_color");
+        context.gradientTailRGB = ParseHexColor(value.get(), parsed) ? parsed : 0x00FF00FF;
     }
-    if (g_isSmearing) {
-        if (startedSmearing) {
-            // A fading tail belongs to the previous motion segment. Do not connect
-            // it to a new segment after a discontinuous cursor repositioning.
-            HistoryClear();
-        }
-        const float target = std::clamp((velocity - g_stopVelocity) / (g_triggerVelocity * 2.0f), 0.0f, 1.0f);
-        g_smoothedSpeedNorm = g_smoothedSpeedNorm * 0.55f + target * 0.45f;
-        const float dx = static_cast<float>(point.x - previousPoint.x);
-        const float dy = static_cast<float>(point.y - previousPoint.y);
-        const float distance = sqrtf(dx * dx + dy * dy);
-        int interpolationSteps = 1;
-        // Start from the current point only. A discontinuous cursor repositioning
-        // must not be turned into a streak when the velocity gate first opens.
-        if (!startedSmearing
-            && g_fastMoveInterpolationEnabled
-            && distance > kFastMoveInterpolationSpacingPx) {
-            const int requiredSteps = static_cast<int>(ceilf(distance / kFastMoveInterpolationSpacingPx));
-            interpolationSteps = std::clamp(requiredSteps, 1, g_maxInterpolationSteps + 1);
-        }
-        // History is stored newest-first, so push the interpolated path toward
-        // the current endpoint in ascending order. Work is capped at six points.
-        for (int step = 1; step <= interpolationSteps; ++step) {
-            const float progress = static_cast<float>(step) / interpolationSteps;
-            const POINT sample = {
-                static_cast<LONG>(std::lround(previousPoint.x + dx * progress)),
-                static_cast<LONG>(std::lround(previousPoint.y + dy * progress)),
-            };
-            HistoryPushFront(sample);
-            while (g_historyCount > g_tailLength) HistoryPopBack();
-        }
-    } else if (g_fadeEnabled) {
-        g_fadeAlpha *= g_fadeDecay;
-        if (g_fadeAlpha < kFadeCutoff || g_historyCount < 2) {
-            HistoryClear();
-            g_fadeAlpha = 0.0f;
-        }
+    context.glowEnabled = yoko::GetClampedIntSetting(L"Effects.glow_enabled", 0, 1);
+    {
+        uint32_t parsed = 0;
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Effects.glow_color");
+        context.glowRGB = ParseHexColor(value.get(), parsed) ? parsed : 0x00FFFFFF;
+    }
+    context.glowWidthFactor = yoko::GetClampedIntSetting(L"Effects.glow_width_factor", 10, 30) / 10.0f;
+    context.glowAlpha = yoko::GetClampedIntSetting(L"Effects.glow_alpha", 0, 100) / 100.0f;
+    context.fadeEnabled = yoko::GetClampedIntSetting(L"Behavior.fade_enabled", 0, 1);
+    context.fadeDecay = yoko::GetClampedIntSetting(L"Behavior.fade_decay", 50, 99) / 100.0f;
+    {
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Color.trail_color_mode");
+        context.trailColorMode = _wcsicmp(value.get(), L"auto") == 0 ? 1 : 0;
+    }
+    {
+        uint32_t parsed = 0;
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Color.trail_color_manual");
+        context.manualColorRGB = ParseHexColor(value.get(), parsed) ? parsed : kFallbackCoreColor;
+    }
+    {
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Color.outline_color_mode");
+        context.outlineColorMode = _wcsicmp(value.get(), L"manual") == 0 ? 1 : 0;
+    }
+    {
+        uint32_t parsed = 0;
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Color.outline_color_manual");
+        context.manualOutlineRGB = ParseHexColor(value.get(), parsed) ? parsed : kFallbackOuterColor;
+    }
+    context.autoResampleInterval = yoko::GetClampedIntSetting(L"Color.auto_resample_interval", 0, kAutoResampleIntervalMaxMs);
+    context.clickFeedbackEnabled = yoko::GetClampedIntSetting(L"Interaction.click_feedback_enabled", 0, 1);
+    context.wheelFeedbackEnabled = yoko::GetClampedIntSetting(L"Interaction.wheel_feedback_enabled", 0, 1);
+    if (!context.clickFeedbackEnabled && !context.wheelFeedbackEnabled) ClearRipples();
+    context.rippleRadius = static_cast<float>(yoko::GetClampedIntSetting(L"Interaction.ripple_radius", 10, 200));
+    context.wheelArrowSize = static_cast<float>(yoko::GetClampedIntSetting(L"Interaction.wheel_arrow_size", 6, 40));
+    context.wheelArrowDistance = static_cast<float>(yoko::GetClampedIntSetting(L"Interaction.wheel_arrow_distance", 8, 120));
+    context.rippleDurationMs = yoko::GetClampedIntSetting(L"Interaction.ripple_duration_ms", 100, 2000);
+    context.rippleStrokeWidth = static_cast<float>(yoko::GetClampedIntSetting(L"Interaction.ripple_width", 1, 10));
+    context.rippleOpacity = yoko::GetClampedIntSetting(L"Interaction.ripple_opacity", 5, 100) / 100.0f;
+    const auto readInteractionColor = [](const wchar_t* settingPath, uint32_t fallbackColor) {
+        uint32_t parsedColor = 0;
+        WindhawkUtils::StringSetting value = WindhawkUtils::StringSetting::make(settingPath);
+        return ParseHexColor(value.get(), parsedColor) ? parsedColor : fallbackColor;
+    };
+    context.leftClickRGB = readInteractionColor(L"Interaction.left_click_color", 0x0000D7FF);
+    context.rightClickRGB = readInteractionColor(L"Interaction.right_click_color", 0x00FF4C8B);
+    context.middleClickRGB = readInteractionColor(L"Interaction.middle_click_color", 0x00FFD166);
+    context.wheelUpRGB = readInteractionColor(L"Interaction.wheel_up_color", 0x007CFF6B);
+    context.wheelDownRGB = readInteractionColor(L"Interaction.wheel_down_color", 0x00A78BFA);
+    context.accelerationAccentEnabled = yoko::GetClampedIntSetting(L"Motion.acceleration_accent_enabled", 0, 1);
+    context.turnAccentEnabled = yoko::GetClampedIntSetting(L"Motion.turn_accent_enabled", 0, 1);
+    context.fastMoveInterpolationEnabled = yoko::GetClampedIntSetting(L"Motion.fast_move_interpolation", 0, 1);
+    context.accelerationThreshold = yoko::GetClampedIntSetting(L"Motion.acceleration_threshold", 3000, 100000);
+    context.motionAccentOpacity = yoko::GetClampedIntSetting(L"Motion.motion_accent_opacity", 10, 100) / 100.0f;
+    context.turnAngleDegrees = yoko::GetClampedIntSetting(L"Motion.turn_angle_degrees", 45, 150);
+    context.turnAccentCosThreshold = cosf(
+        static_cast<float>(context.turnAngleDegrees) * kDegreesToRadians);
+    context.motionAccentDurationMs = yoko::GetClampedIntSetting(L"Motion.motion_accent_duration_ms", 80, 1000);
+    context.motionAccentSize = static_cast<float>(yoko::GetClampedIntSetting(L"Motion.motion_accent_size", 4, 40));
+    context.maxInterpolationSteps = yoko::GetClampedIntSetting(L"Motion.max_interpolation_steps", 1, 6);
+    context.motionAccentRGB = readInteractionColor(L"Motion.motion_accent_color", 0x00FFD166);
+    context.ornamentEnabled = yoko::GetClampedIntSetting(L"Ornament.enabled", 0, 1);
+    OrnamentPreset ornamentPreset = OrnamentPreset::Classic;
+    {
+        WindhawkUtils::StringSetting value =
+            WindhawkUtils::StringSetting::make(L"Ornament.preset");
+        ornamentPreset = ParseOrnamentPreset(value.get());
+    }
+    // A settings blob written before this key existed reads as 0, so fall back
+    // to the preset length instead of clamping to the shortest rope.
+    const int ropeLengthScalePct =
+        Wh_GetIntSetting(L"Ornament.rope_length_scale");
+    context.ornamentRopeLengthScale =
+        std::clamp(ropeLengthScalePct > 0 ? ropeLengthScalePct : 100, 25, 400) / 100.0f;
+    LoadOrnamentImageSpec();
+    ApplyOrnamentPreset(ornamentPreset);
+    context.ornamentAssetsDirty.store(true, std::memory_order_release);
+    ResetMotionCueTracking();
+    ParseAppRules();
+    context.cachedForegroundWindow = nullptr;
+    context.cachedAppRule = 0;
+    context.autoColorInitialized = false;
+    context.lastAutoColorCursor = nullptr;
+    context.lastAutoColorUpdate = 0;
+    if (context.trailColorMode == 0) {
+        SetTrailCoreColor(context.manualColorRGB, RgbLuminance(context.manualColorRGB));
     } else {
-        if (g_historyCount > 0) HistoryPopBack();
-        g_fadeAlpha = 1.0f;
+        SetTrailCoreColor(context.currentCoreRGB, context.currentCoreLuminance);
     }
+    ApplyOverlayCaptureAffinity();
 }
 
-struct ColorCandidate {
-    uint32_t rgb;
-    int count;
-    float luminance;
-};
+// Cursor colour sampling, background luminance and trail colour selection.
 
-static HCURSOR g_cachedCursorCandidateHandle = nullptr;
-static std::vector<ColorCandidate> g_cachedCursorColorCandidates;
-static bool g_cachedCursorCandidatesReady = false;
+
 constexpr float kAutoColorLuminanceChangeThreshold = 0.04f;
-
 static bool ExtractCursorColorCandidates(HCURSOR cursorHandle, std::vector<ColorCandidate>& out) {
     out.clear();
     if (!cursorHandle) return false;
@@ -2682,46 +3404,35 @@ static bool ExtractCursorColorCandidates(HCURSOR cursorHandle, std::vector<Color
     cleanup();
     return false;
 }
-
-HDC g_backgroundSamplerDc = nullptr;
-HBITMAP g_backgroundSamplerBitmap = nullptr;
-HGDIOBJ g_backgroundSamplerOriginal = nullptr;
-uint32_t* g_backgroundSamplerPixels = nullptr;
-int g_backgroundSamplerSize = 0;
-bool g_backgroundLuminanceValid = false;
-POINT g_backgroundLuminanceCenter = {0, 0};
-DWORD g_backgroundLuminanceUpdated = 0;
-float g_backgroundLuminance = 0.5f;
-
 static void ResetAutoColorSamplingCache() {
-    g_backgroundLuminanceValid = false;
-    g_backgroundLuminanceCenter = {0, 0};
-    g_backgroundLuminanceUpdated = 0;
-    g_autoColorPickLuminanceValid = false;
+    context.backgroundLuminanceValid = false;
+    context.backgroundLuminanceCenter = {0, 0};
+    context.backgroundLuminanceUpdated = 0;
+    context.autoColorPickLuminanceValid = false;
 }
 
 static void ReleaseBackgroundSampler() {
-    if (g_backgroundSamplerDc) {
-        if (g_backgroundSamplerOriginal) SelectObject(g_backgroundSamplerDc, g_backgroundSamplerOriginal);
-        DeleteDC(g_backgroundSamplerDc);
-        g_backgroundSamplerDc = nullptr;
+    if (context.backgroundSamplerDc) {
+        if (context.backgroundSamplerOriginal) SelectObject(context.backgroundSamplerDc, context.backgroundSamplerOriginal);
+        DeleteDC(context.backgroundSamplerDc);
+        context.backgroundSamplerDc = nullptr;
     }
-    if (g_backgroundSamplerBitmap) {
-        DeleteObject(g_backgroundSamplerBitmap);
-        g_backgroundSamplerBitmap = nullptr;
+    if (context.backgroundSamplerBitmap) {
+        DeleteObject(context.backgroundSamplerBitmap);
+        context.backgroundSamplerBitmap = nullptr;
     }
-    g_backgroundSamplerOriginal = nullptr;
-    g_backgroundSamplerPixels = nullptr;
-    g_backgroundSamplerSize = 0;
-    g_backgroundLuminanceValid = false;
+    context.backgroundSamplerOriginal = nullptr;
+    context.backgroundSamplerPixels = nullptr;
+    context.backgroundSamplerSize = 0;
+    context.backgroundLuminanceValid = false;
 }
 
 static float SampleBackgroundLuminance(DWORD now, POINT center) {
-    if (g_backgroundLuminanceValid) {
+    if (context.backgroundLuminanceValid) {
         const int64_t dx = static_cast<int64_t>(center.x) -
-                           static_cast<int64_t>(g_backgroundLuminanceCenter.x);
+                           static_cast<int64_t>(context.backgroundLuminanceCenter.x);
         const int64_t dy = static_cast<int64_t>(center.y) -
-                           static_cast<int64_t>(g_backgroundLuminanceCenter.y);
+                           static_cast<int64_t>(context.backgroundLuminanceCenter.y);
         const int64_t distanceThreshold = kBackgroundResampleDistancePx;
         // Short-circuit large coordinate deltas before squaring them; the final
         // squared-distance comparison only runs when both deltas are below 20.
@@ -2731,16 +3442,16 @@ static float SampleBackgroundLuminance(DWORD now, POINT center) {
             dx <= -distanceThreshold || dx >= distanceThreshold ||
             dy <= -distanceThreshold || dy >= distanceThreshold ||
             dx * dx + dy * dy >= distanceThreshold * distanceThreshold;
-        if (now - g_backgroundLuminanceUpdated < kBackgroundResampleIntervalMs
+        if (now - context.backgroundLuminanceUpdated < kBackgroundResampleIntervalMs
             || !movedFarEnough) {
-            return g_backgroundLuminance;
+            return context.backgroundLuminance;
         }
     }
 
     const int size = kBackgroundSampleRadius * 2 + 1;
     HDC screen = GetScreenDC();
-    if (!screen) return g_backgroundLuminanceValid ? g_backgroundLuminance : 0.5f;
-    if (g_backgroundSamplerSize != size || !g_backgroundSamplerDc || !g_backgroundSamplerBitmap || !g_backgroundSamplerPixels) {
+    if (!screen) return context.backgroundLuminanceValid ? context.backgroundLuminance : 0.5f;
+    if (context.backgroundSamplerSize != size || !context.backgroundSamplerDc || !context.backgroundSamplerBitmap || !context.backgroundSamplerPixels) {
         ReleaseBackgroundSampler();
         BITMAPINFO info = {};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -2750,15 +3461,15 @@ static float SampleBackgroundLuminance(DWORD now, POINT center) {
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
         void* bits = nullptr;
-        g_backgroundSamplerBitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!g_backgroundSamplerBitmap || !bits) { ReleaseBackgroundSampler(); return g_backgroundLuminanceValid ? g_backgroundLuminance : 0.5f; }
-        g_backgroundSamplerPixels = static_cast<uint32_t*>(bits);
-        g_backgroundSamplerDc = CreateCompatibleDC(screen);
-        if (!g_backgroundSamplerDc) { ReleaseBackgroundSampler(); return g_backgroundLuminanceValid ? g_backgroundLuminance : 0.5f; }
-        g_backgroundSamplerOriginal = SelectObject(g_backgroundSamplerDc, g_backgroundSamplerBitmap);
-        g_backgroundSamplerSize = size;
+        context.backgroundSamplerBitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!context.backgroundSamplerBitmap || !bits) { ReleaseBackgroundSampler(); return context.backgroundLuminanceValid ? context.backgroundLuminance : 0.5f; }
+        context.backgroundSamplerPixels = static_cast<uint32_t*>(bits);
+        context.backgroundSamplerDc = CreateCompatibleDC(screen);
+        if (!context.backgroundSamplerDc) { ReleaseBackgroundSampler(); return context.backgroundLuminanceValid ? context.backgroundLuminance : 0.5f; }
+        context.backgroundSamplerOriginal = SelectObject(context.backgroundSamplerDc, context.backgroundSamplerBitmap);
+        context.backgroundSamplerSize = size;
     }
-    if (!BitBlt(g_backgroundSamplerDc, 0, 0, size, size, screen, center.x - kBackgroundSampleRadius, center.y - kBackgroundSampleRadius, SRCCOPY)) return g_backgroundLuminanceValid ? g_backgroundLuminance : 0.5f;
+    if (!BitBlt(context.backgroundSamplerDc, 0, 0, size, size, screen, center.x - kBackgroundSampleRadius, center.y - kBackgroundSampleRadius, SRCCOPY)) return context.backgroundLuminanceValid ? context.backgroundLuminance : 0.5f;
     // GDI batches drawing calls, so the blit has to be flushed before the DIB
     // section bits are read directly.
     GdiFlush();
@@ -2768,56 +3479,56 @@ static float SampleBackgroundLuminance(DWORD now, POINT center) {
         const int y = (size - 1) * yIndex / (kBackgroundSampleGrid - 1);
         for (int xIndex = 0; xIndex < kBackgroundSampleGrid; ++xIndex) {
             const int x = (size - 1) * xIndex / (kBackgroundSampleGrid - 1);
-            const uint32_t pixel = g_backgroundSamplerPixels[y * size + x];
+            const uint32_t pixel = context.backgroundSamplerPixels[y * size + x];
             sum += RgbLuminance(static_cast<uint8_t>((pixel >> 16) & 0xFF), static_cast<uint8_t>((pixel >> 8) & 0xFF), static_cast<uint8_t>(pixel & 0xFF));
             ++count;
         }
     }
     const float luminance = count ? static_cast<float>(sum / count) : 0.5f;
-    g_backgroundLuminance = luminance;
-    g_backgroundLuminanceCenter = center;
-    g_backgroundLuminanceUpdated = now;
-    g_backgroundLuminanceValid = true;
+    context.backgroundLuminance = luminance;
+    context.backgroundLuminanceCenter = center;
+    context.backgroundLuminanceUpdated = now;
+    context.backgroundLuminanceValid = true;
     return luminance;
 }
 
 static void SetTrailCoreColor(uint32_t core, float luminance) {
-    g_currentCoreRGB = core;
-    g_currentCoreLuminance = luminance;
-    if (g_outlineColorMode == 1) {
-        g_currentOuterRGB = g_manualOutlineRGB;
+    context.currentCoreRGB = core;
+    context.currentCoreLuminance = luminance;
+    if (context.outlineColorMode == 1) {
+        context.currentOuterRGB = context.manualOutlineRGB;
         return;
     }
-    g_currentOuterRGB = luminance > 0.5f ? kFallbackOuterColor : kFallbackCoreColor;
+    context.currentOuterRGB = luminance > 0.5f ? kFallbackOuterColor : kFallbackCoreColor;
 }
 
 static void UpdateTrailColorIfNeeded(DWORD now, const POINT& point) {
-    if (g_trailColorMode == 0) {
-        if (g_currentCoreRGB != g_manualColorRGB) {
-            SetTrailCoreColor(g_manualColorRGB, RgbLuminance(g_manualColorRGB));
+    if (context.trailColorMode == 0) {
+        if (context.currentCoreRGB != context.manualColorRGB) {
+            SetTrailCoreColor(context.manualColorRGB, RgbLuminance(context.manualColorRGB));
         }
         return;
     }
 
-    CURSORINFO cursorInfo = {sizeof(cursorInfo)};
-    if (!GetCursorInfo(&cursorInfo) || !(cursorInfo.flags & CURSOR_SHOWING) || !cursorInfo.hCursor) {
-        g_lastAutoColorCursor = nullptr;
-        g_autoColorInitialized = true;
-        g_autoColorPickLuminanceValid = false;
-        g_cachedCursorCandidateHandle = nullptr;
-        g_cachedCursorColorCandidates.clear();
-        g_cachedCursorCandidatesReady = false;
+    yoko::win32::UniqueCursorInfo cursorInfo;
+    if (!cursorInfo.query() || !cursorInfo.visible()) {
+        context.lastAutoColorCursor = nullptr;
+        context.autoColorInitialized = true;
+        context.autoColorPickLuminanceValid = false;
+        context.cachedCursorCandidateHandle = nullptr;
+        context.cachedCursorColorCandidates.clear();
+        context.cachedCursorCandidatesReady = false;
         SetTrailCoreColor(kFallbackCoreColor, kFallbackCoreLuminance);
         return;
     }
 
-    const HCURSOR cursorHandle = cursorInfo.hCursor;
-    const bool cursorChanged = !g_autoColorInitialized || cursorHandle != g_lastAutoColorCursor;
-    const bool intervalElapsed = g_autoResampleInterval > 0
-        && now - g_lastAutoColorUpdate >= static_cast<DWORD>(g_autoResampleInterval);
+    const HCURSOR cursorHandle = cursorInfo.value.hCursor;
+    const bool cursorChanged = !context.autoColorInitialized || cursorHandle != context.lastAutoColorCursor;
+    const bool intervalElapsed = context.autoResampleInterval > 0
+        && now - context.lastAutoColorUpdate >= static_cast<DWORD>(context.autoResampleInterval);
     const bool refreshCandidates = cursorChanged || intervalElapsed
-        || !g_cachedCursorCandidatesReady
-        || g_cachedCursorCandidateHandle != cursorHandle;
+        || !context.cachedCursorCandidatesReady
+        || context.cachedCursorCandidateHandle != cursorHandle;
 
     // SampleBackgroundLuminance already throttles screen reads by both time and
     // cursor travel. Use its cached value to adapt contrast without re-reading
@@ -2825,66 +3536,69 @@ static void UpdateTrailColorIfNeeded(DWORD now, const POINT& point) {
     const float background = SampleBackgroundLuminance(now, point);
 
     if (refreshCandidates) {
-        g_cachedCursorColorCandidates.clear();
-        g_cachedCursorCandidatesReady = true;
-        g_cachedCursorCandidateHandle = cursorHandle;
-        ExtractCursorColorCandidates(cursorHandle, g_cachedCursorColorCandidates);
+        context.cachedCursorColorCandidates.clear();
+        context.cachedCursorCandidatesReady = true;
+        context.cachedCursorCandidateHandle = cursorHandle;
+        ExtractCursorColorCandidates(cursorHandle, context.cachedCursorColorCandidates);
         // A cursor bitmap is resampled only when its handle or the configured
         // interval changes. Fold luminance into that same step so selection
         // never pays for it per frame.
-        for (ColorCandidate& candidate : g_cachedCursorColorCandidates) {
+        for (ColorCandidate& candidate : context.cachedCursorColorCandidates) {
             candidate.luminance = RgbLuminance(candidate.rgb);
         }
-        g_lastAutoColorCursor = cursorHandle;
-        g_lastAutoColorUpdate = now;
-        g_autoColorInitialized = true;
+        context.lastAutoColorCursor = cursorHandle;
+        context.lastAutoColorUpdate = now;
+        context.autoColorInitialized = true;
     }
 
-    if (g_cachedCursorColorCandidates.empty()) {
+    if (context.cachedCursorColorCandidates.empty()) {
         SetTrailCoreColor(kFallbackCoreColor, kFallbackCoreLuminance);
-        g_autoColorPickLuminanceValid = false;
+        context.autoColorPickLuminanceValid = false;
         return;
     }
 
-    const bool backgroundChanged = !g_autoColorPickLuminanceValid
-        || fabsf(background - g_lastAutoColorPickLuminance) >= kAutoColorLuminanceChangeThreshold;
+    const bool backgroundChanged = !context.autoColorPickLuminanceValid
+        || fabsf(background - context.lastAutoColorPickLuminance) >= kAutoColorLuminanceChangeThreshold;
     if (!refreshCandidates && !backgroundChanged) return;
 
     // Keep the existing color when it still has acceptable contrast. Using a
     // lower hold threshold than the selection threshold prevents color flapping.
     if (!refreshCandidates
-        && ContrastRatio(g_currentCoreLuminance, background)
+        && ContrastRatio(context.currentCoreLuminance, background)
             >= kAutoColorHysteresisContrast) {
-        g_lastAutoColorPickLuminance = background;
-        g_autoColorPickLuminanceValid = true;
+        context.lastAutoColorPickLuminance = background;
+        context.autoColorPickLuminanceValid = true;
         return;
     }
 
     // In Auto mode the overlay is excluded from screen capture, so the sample
     // can't pick up the trail's own pixels and the window need not be hidden.
-    for (const ColorCandidate& candidate : g_cachedCursorColorCandidates) {
+    for (const ColorCandidate& candidate : context.cachedCursorColorCandidates) {
         if (ContrastRatio(candidate.luminance, background) >= kMinColorContrast) {
             SetTrailCoreColor(candidate.rgb, candidate.luminance);
-            g_lastAutoColorPickLuminance = background;
-            g_autoColorPickLuminanceValid = true;
+            context.lastAutoColorPickLuminance = background;
+            context.autoColorPickLuminanceValid = true;
             return;
         }
     }
 
     SetTrailCoreColor(kFallbackCoreColor, kFallbackCoreLuminance);
-    g_lastAutoColorPickLuminance = background;
-    g_autoColorPickLuminanceValid = true;
+    context.lastAutoColorPickLuminance = background;
+    context.autoColorPickLuminanceValid = true;
 }
+
+// Ornament assets, physics and drawing.
+
 
 static D2D1_POINT_2F OrnamentAnchorPoint() {
     return D2D1::Point2F(
-        static_cast<float>(g_lastPos.x) + g_ornamentAnchorOffsetX * g_currentDpiScale,
-        static_cast<float>(g_lastPos.y) + g_ornamentAnchorOffsetY * g_currentDpiScale);
+        static_cast<float>(context.lastPos.x) + context.ornamentAnchorOffsetX * context.currentDpiScale,
+        static_cast<float>(context.lastPos.y) + context.ornamentAnchorOffsetY * context.currentDpiScale);
 }
 
 static void ReleaseOrnamentBitmaps() {
-    g_ornamentBitmapsSettled = false;
-    for (OrnamentImage& image : g_ornamentImages) {
+    context.ornamentBitmapsSettled = false;
+    for (OrnamentImage& image : context.ornamentImages) {
         if (image.bitmap) {
             image.bitmap->Release();
             image.bitmap = nullptr;
@@ -2897,23 +3611,23 @@ static void ReleaseOrnamentBitmaps() {
 
 static void ReleaseOrnamentAssets() {
     ReleaseOrnamentBitmaps();
-    g_ornamentImages.clear();
-    g_ornamentNodes.clear();
-    if (g_wicFactory) {
-        g_wicFactory->Release();
-        g_wicFactory = nullptr;
+    context.ornamentImages.clear();
+    context.ornamentNodes.clear();
+    if (context.wicFactory) {
+        context.wicFactory->Release();
+        context.wicFactory = nullptr;
     }
-    g_ornamentAssetsReady = false;
-    g_ornamentPhysicsInitialized = false;
-    g_ornamentRedrawPending = false;
-    g_ornamentSmoothedSpeedNorm = 0.0f;
-    g_ornamentSmoothedSpeedPx = 0.0f;
+    context.ornamentAssetsReady = false;
+    context.ornamentPhysicsInitialized = false;
+    context.ornamentRedrawPending = false;
+    context.ornamentSmoothedSpeedNorm = 0.0f;
+    context.ornamentSmoothedSpeedPx = 0.0f;
 }
 
 static int FindOrnamentImageIndexById(const std::wstring& id) {
     if (id.empty()) return -1;
-    for (size_t i = 0; i < g_ornamentImages.size(); ++i) {
-        if (_wcsicmp(g_ornamentImages[i].id.c_str(), id.c_str()) == 0) {
+    for (size_t i = 0; i < context.ornamentImages.size(); ++i) {
+        if (_wcsicmp(context.ornamentImages[i].id.c_str(), id.c_str()) == 0) {
             return static_cast<int>(i);
         }
     }
@@ -2932,7 +3646,7 @@ static bool ProbeOrnamentImage(
     OrnamentImage& output) {
     output.id = spec.id;
     output.path = spec.path;
-    if (!g_wicFactory) return false;
+    if (!context.wicFactory) return false;
 
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
@@ -2941,7 +3655,7 @@ static bool ProbeOrnamentImage(
         if (decoder) { decoder->Release(); decoder = nullptr; }
     };
 
-    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
+    HRESULT hr = context.wicFactory->CreateDecoderFromFilename(
         spec.path.c_str(),
         nullptr,
         GENERIC_READ,
@@ -2983,7 +3697,7 @@ static bool ProbeOrnamentImage(
 }
 
 static bool DecodeOrnamentPixels(OrnamentImage& image) {
-    if (!g_wicFactory || image.path.empty()) return false;
+    if (!context.wicFactory || image.path.empty()) return false;
 
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
@@ -2994,7 +3708,7 @@ static bool DecodeOrnamentPixels(OrnamentImage& image) {
         if (decoder) { decoder->Release(); decoder = nullptr; }
     };
 
-    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
+    HRESULT hr = context.wicFactory->CreateDecoderFromFilename(
         image.path.c_str(),
         nullptr,
         GENERIC_READ,
@@ -3029,7 +3743,7 @@ static bool DecodeOrnamentPixels(OrnamentImage& image) {
         releaseInterfaces();
         return false;
     }
-    hr = g_wicFactory->CreateFormatConverter(&converter);
+    hr = context.wicFactory->CreateFormatConverter(&converter);
     if (FAILED(hr) || !converter) {
         releaseInterfaces();
         return false;
@@ -3063,29 +3777,29 @@ static bool DecodeOrnamentPixels(OrnamentImage& image) {
 }
 
 static void BuildOrnamentImages() {
-    g_ornamentImages.clear();
-    g_ornamentImages.reserve(g_ornamentImageSpecs.size());
-    if (!g_ornamentImageSpecs.empty()) {
+    context.ornamentImages.clear();
+    context.ornamentImages.reserve(context.ornamentImageSpecs.size());
+    if (!context.ornamentImageSpecs.empty()) {
         const HRESULT hr = CoCreateInstance(
             CLSID_WICImagingFactory,
             nullptr,
             CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&g_wicFactory));
-        if (FAILED(hr) || !g_wicFactory) {
+            IID_PPV_ARGS(&context.wicFactory));
+        if (FAILED(hr) || !context.wicFactory) {
             Wh_Log(L"Failed to create WIC imaging factory for ornaments");
         }
     }
-    for (const OrnamentImageSpec& spec : g_ornamentImageSpecs) {
+    for (const OrnamentImageSpec& spec : context.ornamentImageSpecs) {
         OrnamentImage image;
         if (!ProbeOrnamentImage(spec, image)) image.decodeFailed = true;
-        g_ornamentImages.push_back(std::move(image));
+        context.ornamentImages.push_back(std::move(image));
     }
 }
 
 static void BuildOrnamentNodes() {
-    g_ornamentNodes.clear();
-    g_ornamentNodes.reserve(g_ornamentNodeSpecs.size());
-    for (const OrnamentNodeSpec& spec : g_ornamentNodeSpecs) {
+    context.ornamentNodes.clear();
+    context.ornamentNodes.reserve(context.ornamentNodeSpecs.size());
+    for (const OrnamentNodeSpec& spec : context.ornamentNodeSpecs) {
         OrnamentNode node;
         // A node without a decoded image still renders the circular fallback,
         // so the index stays -1 and the preset remains usable with no image.
@@ -3096,49 +3810,49 @@ static void BuildOrnamentNodes() {
         node.pivotX = spec.pivotX;
         node.pivotY = spec.pivotY;
         node.opacity = spec.opacity;
-        g_ornamentNodes.push_back(node);
+        context.ornamentNodes.push_back(node);
     }
 }
 
 static void ResetOrnamentPhysics() {
-    const int segments = std::clamp(g_ornamentRopeSegments, 1, kOrnamentMaxRopeSegments);
-    g_ornamentRopePointCount = segments + 1;
-    const float length = std::max(1.0f, g_ornamentRopeLengthPx * g_currentDpiScale);
-    g_ornamentRopeSegmentPx = length / static_cast<float>(segments);
+    const int segments = std::clamp(context.ornamentRopeSegments, 1, kOrnamentMaxRopeSegments);
+    context.ornamentRopePointCount = segments + 1;
+    const float length = std::max(1.0f, context.ornamentRopeLengthPx * context.currentDpiScale);
+    context.ornamentRopeSegmentPx = length / static_cast<float>(segments);
     D2D1_POINT_2F anchor = OrnamentAnchorPoint();
-    for (int i = 0; i < g_ornamentRopePointCount; ++i) {
+    for (int i = 0; i < context.ornamentRopePointCount; ++i) {
         const D2D1_POINT_2F point = D2D1::Point2F(
             anchor.x,
-            anchor.y + g_ornamentRopeSegmentPx * static_cast<float>(i));
-        g_ornamentRopePoints[i] = point;
-        g_ornamentRopePrevious[i] = point;
+            anchor.y + context.ornamentRopeSegmentPx * static_cast<float>(i));
+        context.ornamentRopePoints[i] = point;
+        context.ornamentRopePrevious[i] = point;
     }
-    g_ornamentLastAnchor = anchor;
-    g_ornamentSmoothedSpeedNorm = 0.0f;
-    g_ornamentSmoothedSpeedPx = 0.0f;
-    g_ornamentPhysicsInitialized = true;
-    g_ornamentRedrawPending = true;
+    context.ornamentLastAnchor = anchor;
+    context.ornamentSmoothedSpeedNorm = 0.0f;
+    context.ornamentSmoothedSpeedPx = 0.0f;
+    context.ornamentPhysicsInitialized = true;
+    context.ornamentRedrawPending = true;
 }
 
 static void EnsureOrnamentAssetsLoaded() {
-    if (!g_ornamentEnabled) {
-        if (g_ornamentAssetsReady || !g_ornamentImages.empty()) ReleaseOrnamentAssets();
+    if (!context.ornamentEnabled) {
+        if (context.ornamentAssetsReady || !context.ornamentImages.empty()) ReleaseOrnamentAssets();
         return;
     }
-    const bool dirty = g_ornamentAssetsDirty.exchange(false, std::memory_order_acq_rel);
-    if (!dirty && g_ornamentAssetsReady) return;
+    const bool dirty = context.ornamentAssetsDirty.exchange(false, std::memory_order_acq_rel);
+    if (!dirty && context.ornamentAssetsReady) return;
     ReleaseOrnamentAssets();
     BuildOrnamentImages();
     BuildOrnamentNodes();
-    g_ornamentAssetsReady = true;
-    g_ornamentPhysicsInitialized = false;
-    g_ornamentRedrawPending = true;
+    context.ornamentAssetsReady = true;
+    context.ornamentPhysicsInitialized = false;
+    context.ornamentRedrawPending = true;
 }
 
 static void EnsureOrnamentBitmaps() {
-    if (!g_renderTarget || !g_ornamentAssetsReady) return;
-    if (g_ornamentBitmapsSettled) return;
-    for (OrnamentImage& image : g_ornamentImages) {
+    if (!context.renderTarget || !context.ornamentAssetsReady) return;
+    if (context.ornamentBitmapsSettled) return;
+    for (OrnamentImage& image : context.ornamentImages) {
         if (image.bitmap || image.decodeFailed || image.uploadFailed) continue;
         // One image at a time, so the peak CPU memory never holds more than a
         // single decoded image. Metadata is probed once at build time, so an
@@ -3160,7 +3874,7 @@ static void EnsureOrnamentBitmaps() {
             96.0f);
         const D2D1_SIZE_U size = D2D1::SizeU(image.width, image.height);
         const UINT stride = image.width * 4u;
-        const HRESULT hr = g_renderTarget->CreateBitmap(
+        const HRESULT hr = context.renderTarget->CreateBitmap(
             size,
             image.pixels.data(),
             stride,
@@ -3179,19 +3893,19 @@ static void EnsureOrnamentBitmaps() {
     }
     // Every branch above ends with a device bitmap or a latched failure, so
     // one pass settles the list. ReleaseOrnamentBitmaps clears the latch.
-    g_ornamentBitmapsSettled = true;
+    context.ornamentBitmapsSettled = true;
 }
 
 static void UpdateOrnamentNodeGeometry(OrnamentNode& node) {
     float aspect = 1.0f;
     if (node.imageIndex >= 0
-        && node.imageIndex < static_cast<int>(g_ornamentImages.size())) {
-        const OrnamentImage& image = g_ornamentImages[static_cast<size_t>(node.imageIndex)];
+        && node.imageIndex < static_cast<int>(context.ornamentImages.size())) {
+        const OrnamentImage& image = context.ornamentImages[static_cast<size_t>(node.imageIndex)];
         if (image.width > 0 && image.height > 0) {
             aspect = static_cast<float>(image.width) / static_cast<float>(image.height);
         }
     }
-    const float size = std::max(1.0f, node.sizePx * g_currentDpiScale);
+    const float size = std::max(1.0f, node.sizePx * context.currentDpiScale);
     const float width = aspect >= 1.0f ? size : size * aspect;
     const float height = aspect >= 1.0f ? size / aspect : size;
     node.localBounds = D2D1::RectF(
@@ -3208,27 +3922,27 @@ static D2D1_MATRIX_3X2_F OrnamentNodeMatrix(const OrnamentNode& node) {
 }
 
 static D2D1_POINT_2F OrnamentRopePointAt(float t) {
-    const int count = g_ornamentRopePointCount;
+    const int count = context.ornamentRopePointCount;
     if (count <= 0) return D2D1::Point2F(0.0f, 0.0f);
-    if (count == 1) return g_ornamentRopePoints[0];
+    if (count == 1) return context.ornamentRopePoints[0];
     const float location =
         std::clamp(t, 0.0f, 1.0f) * static_cast<float>(count - 1);
     const int index = std::min(static_cast<int>(location), count - 2);
     const float fraction = location - static_cast<float>(index);
-    const D2D1_POINT_2F& a = g_ornamentRopePoints[index];
-    const D2D1_POINT_2F& b = g_ornamentRopePoints[index + 1];
+    const D2D1_POINT_2F& a = context.ornamentRopePoints[index];
+    const D2D1_POINT_2F& b = context.ornamentRopePoints[index + 1];
     return D2D1::Point2F(
         a.x + (b.x - a.x) * fraction,
         a.y + (b.y - a.y) * fraction);
 }
 
 static void UpdateOrnamentDrawStates() {
-    if (g_ornamentNodes.empty()) return;
-    if (g_ornamentRopePointCount < 2) return;
-    const float speed = std::clamp(g_ornamentSmoothedSpeedNorm, 0.0f, 1.0f);
-    const float stretchScale = 1.0f + g_ornamentStretch * speed;
+    if (context.ornamentNodes.empty()) return;
+    if (context.ornamentRopePointCount < 2) return;
+    const float speed = std::clamp(context.ornamentSmoothedSpeedNorm, 0.0f, 1.0f);
+    const float stretchScale = 1.0f + context.ornamentStretch * speed;
     const float compensatingScale = 1.0f / sqrtf(std::max(0.01f, stretchScale));
-    for (OrnamentNode& node : g_ornamentNodes) {
+    for (OrnamentNode& node : context.ornamentNodes) {
         const float t = std::clamp(node.ropeT, 0.0f, 1.0f);
         node.position = OrnamentRopePointAt(t);
         const D2D1_POINT_2F before = OrnamentRopePointAt(t - 0.02f);
@@ -3277,42 +3991,42 @@ static void StepOrnamentPhysics(
     float retain,
     float anchorStepX,
     float anchorStepY) {
-    const int count = g_ornamentRopePointCount;
+    const int count = context.ornamentRopePointCount;
     if (count < 2) return;
-    const float gravityStep = g_ornamentGravity * g_currentDpiScale * dtSeconds * dtSeconds;
+    const float gravityStep = context.ornamentGravity * context.currentDpiScale * dtSeconds * dtSeconds;
     for (int i = 1; i < count; ++i) {
-        D2D1_POINT_2F& point = g_ornamentRopePoints[i];
+        D2D1_POINT_2F& point = context.ornamentRopePoints[i];
         // Verlet velocity is world-space. Damping must act on the velocity
         // relative to the moving anchor; otherwise dragging the cursor at a
         // constant speed looks like wind and tilts the rope by a speed-dependent
         // angle. Subtract the frame displacement, then add it back to position.
-        const float vx = point.x - g_ornamentRopePrevious[i].x - anchorStepX;
-        const float vy = point.y - g_ornamentRopePrevious[i].y - anchorStepY;
-        g_ornamentRopePrevious[i] = point;
+        const float vx = point.x - context.ornamentRopePrevious[i].x - anchorStepX;
+        const float vy = point.y - context.ornamentRopePrevious[i].y - anchorStepY;
+        context.ornamentRopePrevious[i] = point;
         point.x += vx * retain + anchorStepX;
         point.y += vy * retain + anchorStepY + gravityStep;
     }
 
     D2D1_POINT_2F anchor = OrnamentAnchorPoint();
-    for (int iteration = 0; iteration < g_ornamentConstraintIterations; ++iteration) {
-        g_ornamentRopePoints[0] = anchor;
+    for (int iteration = 0; iteration < context.ornamentConstraintIterations; ++iteration) {
+        context.ornamentRopePoints[0] = anchor;
         ConstrainOrnamentDistance(
-            g_ornamentRopePoints[1],
+            context.ornamentRopePoints[1],
             anchor,
-            g_ornamentRopeSegmentPx,
+            context.ornamentRopeSegmentPx,
             false);
         for (int i = 1; i < count - 1; ++i) {
             ConstrainOrnamentDistance(
-                g_ornamentRopePoints[i + 1],
-                g_ornamentRopePoints[i],
-                g_ornamentRopeSegmentPx,
+                context.ornamentRopePoints[i + 1],
+                context.ornamentRopePoints[i],
+                context.ornamentRopeSegmentPx,
                 true);
         }
     }
-    g_ornamentRopePoints[0] = anchor;
+    context.ornamentRopePoints[0] = anchor;
     for (int i = 0; i < count; ++i) {
-        if (!std::isfinite(g_ornamentRopePoints[i].x)
-            || !std::isfinite(g_ornamentRopePoints[i].y)) {
+        if (!std::isfinite(context.ornamentRopePoints[i].x)
+            || !std::isfinite(context.ornamentRopePoints[i].y)) {
             ResetOrnamentPhysics();
             return;
         }
@@ -3320,48 +4034,48 @@ static void StepOrnamentPhysics(
 }
 
 static bool OrnamentAnimating() {
-    for (int i = 1; i < g_ornamentRopePointCount; ++i) {
-        const float dx = g_ornamentRopePoints[i].x - g_ornamentRopePrevious[i].x;
-        const float dy = g_ornamentRopePoints[i].y - g_ornamentRopePrevious[i].y;
+    for (int i = 1; i < context.ornamentRopePointCount; ++i) {
+        const float dx = context.ornamentRopePoints[i].x - context.ornamentRopePrevious[i].x;
+        const float dy = context.ornamentRopePoints[i].y - context.ornamentRopePrevious[i].y;
         if (dx * dx + dy * dy > kOrnamentRestVelocityPx * kOrnamentRestVelocityPx) return true;
     }
     return false;
 }
 
 static void UpdateOrnamentPhysics(float velocity, LONGLONG nowQpc) {
-    const bool visible = g_ornamentEnabled && g_ornamentAssetsReady && !g_ornamentNodes.empty();
+    const bool visible = context.ornamentEnabled && context.ornamentAssetsReady && !context.ornamentNodes.empty();
     if (!visible) {
-        g_ornamentPhysicsInitialized = false;
-        g_ornamentRedrawPending = false;
-        g_ornamentSmoothedSpeedPx = 0.0f;
-        g_ornamentSmoothedSpeedNorm = 0.0f;
+        context.ornamentPhysicsInitialized = false;
+        context.ornamentRedrawPending = false;
+        context.ornamentSmoothedSpeedPx = 0.0f;
+        context.ornamentSmoothedSpeedNorm = 0.0f;
         return;
     }
 
     const float targetSpeedPx = std::max(0.0f, velocity);
-    g_ornamentSmoothedSpeedPx += (targetSpeedPx - g_ornamentSmoothedSpeedPx)
+    context.ornamentSmoothedSpeedPx += (targetSpeedPx - context.ornamentSmoothedSpeedPx)
         * kOrnamentSpeedSmoothing;
-    g_ornamentSmoothedSpeedNorm = std::clamp(
-        g_ornamentSmoothedSpeedPx / kOrnamentSpeedReferencePxPerSecond,
+    context.ornamentSmoothedSpeedNorm = std::clamp(
+        context.ornamentSmoothedSpeedPx / kOrnamentSpeedReferencePxPerSecond,
         0.0f,
         1.0f);
 
-    if (!g_ornamentPhysicsInitialized) {
+    if (!context.ornamentPhysicsInitialized) {
         ResetOrnamentPhysics();
-        g_ornamentLastStepQpc = nowQpc;
+        context.ornamentLastStepQpc = nowQpc;
     }
 
     const D2D1_POINT_2F anchor = OrnamentAnchorPoint();
-    const float anchorStepX = anchor.x - g_ornamentLastAnchor.x;
-    const float anchorStepY = anchor.y - g_ornamentLastAnchor.y;
+    const float anchorStepX = anchor.x - context.ornamentLastAnchor.x;
+    const float anchorStepY = anchor.y - context.ornamentLastAnchor.y;
 
     float elapsed = 0.0f;
-    if (g_ornamentLastStepQpc > 0 && nowQpc > g_ornamentLastStepQpc && g_qpcFrequency > 0) {
-        elapsed = static_cast<float>(nowQpc - g_ornamentLastStepQpc)
-            / static_cast<float>(g_qpcFrequency);
+    if (context.ornamentLastStepQpc > 0 && nowQpc > context.ornamentLastStepQpc && context.qpcFrequency > 0) {
+        elapsed = static_cast<float>(nowQpc - context.ornamentLastStepQpc)
+            / static_cast<float>(context.qpcFrequency);
     }
     elapsed = std::clamp(elapsed, 0.0f, kOrnamentMaxCatchUpSeconds);
-    g_ornamentLastStepQpc = nowQpc;
+    context.ornamentLastStepQpc = nowQpc;
     if (elapsed > 0.0f) {
         const float fixedStep = 1.0f / kOrnamentSimulationHz;
         int steps = std::max(1, static_cast<int>(ceilf(elapsed / fixedStep)));
@@ -3372,78 +4086,78 @@ static void UpdateOrnamentPhysics(float velocity, LONGLONG nowQpc) {
         // Damping is the same for every substep, so the exponential is
         // evaluated once per frame instead of once per substep.
         const float retain = powf(
-            std::clamp(1.0f - g_ornamentDamping / 100.0f, 0.5f, 1.0f),
+            std::clamp(1.0f - context.ornamentDamping / 100.0f, 0.5f, 1.0f),
             step * kOrnamentSimulationHz);
         for (int i = 0; i < steps; ++i) {
             StepOrnamentPhysics(step, retain, stepX, stepY);
         }
-        g_ornamentLastAnchor = anchor;
+        context.ornamentLastAnchor = anchor;
     }
 
     if (OrnamentAnimating()) {
-        g_ornamentRedrawPending = true;
+        context.ornamentRedrawPending = true;
     }
 }
 
 static bool OrnamentVisible() {
-    return g_ornamentEnabled
-        && g_ornamentAssetsReady
-        && !g_ornamentNodes.empty()
-        && g_ornamentOpacity > 0.0f;
+    return context.ornamentEnabled
+        && context.ornamentAssetsReady
+        && !context.ornamentNodes.empty()
+        && context.ornamentOpacity > 0.0f;
 }
 
 static bool OrnamentActive() {
     return OrnamentVisible()
-        && (g_ornamentRedrawPending || OrnamentAnimating());
+        && (context.ornamentRedrawPending || OrnamentAnimating());
 }
 
 // A click or wheel impulse is a one-shot velocity applied to the whole chain.
 static void QueueOrnamentImpulse(float impulseY, LONGLONG nowQpc) {
     if (!OrnamentVisible()) return;
-    if (!g_ornamentPhysicsInitialized) {
+    if (!context.ornamentPhysicsInitialized) {
         ResetOrnamentPhysics();
     }
     // Rebase the simulation clock so the impulse is not consumed by a catch-up
     // step covering the idle interval before the input.
-    g_ornamentLastStepQpc = nowQpc;
+    context.ornamentLastStepQpc = nowQpc;
     // The impulse is a velocity in pixels per second applied once. Verlet keeps
     // velocity in position deltas, so convert it with the fixed simulation step.
     const float stepSeconds = 1.0f / kOrnamentSimulationHz;
     const float deltaY = impulseY * stepSeconds;
-    for (int i = 1; i < g_ornamentRopePointCount; ++i) {
-        g_ornamentRopePrevious[i].y += deltaY;
+    for (int i = 1; i < context.ornamentRopePointCount; ++i) {
+        context.ornamentRopePrevious[i].y += deltaY;
     }
-    g_ornamentRedrawPending = true;
-    g_interactionPending = true;
-    if (g_inputWakeEvent) SetEvent(g_inputWakeEvent);
+    context.ornamentRedrawPending = true;
+    context.interactionPending = true;
+    if (context.inputWakeEvent) SetEvent(context.inputWakeEvent);
 }
 
 static void SuppressOrnament(LONGLONG nowQpc) {
-    g_ornamentPhysicsInitialized = false;
-    g_ornamentLastStepQpc = nowQpc;
-    g_ornamentRedrawPending = false;
-    g_ornamentSmoothedSpeedPx = 0.0f;
-    g_ornamentSmoothedSpeedNorm = 0.0f;
+    context.ornamentPhysicsInitialized = false;
+    context.ornamentLastStepQpc = nowQpc;
+    context.ornamentRedrawPending = false;
+    context.ornamentSmoothedSpeedPx = 0.0f;
+    context.ornamentSmoothedSpeedNorm = 0.0f;
 }
 
 static RECT CalculateOrnamentBounds() {
     RECT bounds = {};
     bool hasBounds = false;
-    const float padding = 2.0f * g_currentDpiScale;
+    const float padding = 2.0f * context.currentDpiScale;
     const float ropeOpacity =
-        std::clamp(g_ornamentRopeOpacity * g_ornamentOpacity, 0.0f, 1.0f);
-    if (g_ornamentRopePointCount >= 2 && ropeOpacity > kOrnamentMinDrawOpacity) {
+        std::clamp(context.ornamentRopeOpacity * context.ornamentOpacity, 0.0f, 1.0f);
+    if (context.ornamentRopePointCount >= 2 && ropeOpacity > kOrnamentMinDrawOpacity) {
         const float ropePadding =
-            padding + g_ornamentRopeWidthPx * g_currentDpiScale * 4.0f;
+            padding + context.ornamentRopeWidthPx * context.currentDpiScale * 4.0f;
         float minX = std::numeric_limits<float>::max();
         float minY = std::numeric_limits<float>::max();
         float maxX = std::numeric_limits<float>::lowest();
         float maxY = std::numeric_limits<float>::lowest();
-        for (int i = 0; i < g_ornamentRopePointCount; ++i) {
-            minX = std::min(minX, g_ornamentRopePoints[i].x);
-            minY = std::min(minY, g_ornamentRopePoints[i].y);
-            maxX = std::max(maxX, g_ornamentRopePoints[i].x);
-            maxY = std::max(maxY, g_ornamentRopePoints[i].y);
+        for (int i = 0; i < context.ornamentRopePointCount; ++i) {
+            minX = std::min(minX, context.ornamentRopePoints[i].x);
+            minY = std::min(minY, context.ornamentRopePoints[i].y);
+            maxX = std::max(maxX, context.ornamentRopePoints[i].x);
+            maxY = std::max(maxY, context.ornamentRopePoints[i].y);
         }
         bounds.left = static_cast<LONG>(floorf(minX - ropePadding));
         bounds.top = static_cast<LONG>(floorf(minY - ropePadding));
@@ -3451,8 +4165,8 @@ static RECT CalculateOrnamentBounds() {
         bounds.bottom = static_cast<LONG>(ceilf(maxY + ropePadding));
         hasBounds = true;
     }
-    for (const OrnamentNode& node : g_ornamentNodes) {
-        if (node.opacity * g_ornamentOpacity <= kOrnamentMinDrawOpacity) continue;
+    for (const OrnamentNode& node : context.ornamentNodes) {
+        if (node.opacity * context.ornamentOpacity <= kOrnamentMinDrawOpacity) continue;
         const D2D1_MATRIX_3X2_F matrix = OrnamentNodeMatrix(node);
         const D2D1_POINT_2F corners[4] = {
             D2D1::Point2F(node.localBounds.left, node.localBounds.top),
@@ -3525,140 +4239,143 @@ static void StrokeOrnamentRope(
     float alpha,
     uint32_t rgb,
     float taper) {
-    if (!g_ornamentBrush || count < 2) return;
+    if (!context.ornamentBrush || count < 2) return;
     for (int i = 0; i + 1 < count; ++i) {
         const float t =
             (static_cast<float>(i) + 0.5f) / static_cast<float>(count - 1);
         const float segmentAlpha =
             std::clamp(alpha * (0.5f + 0.5f * t), 0.0f, 1.0f);
-        g_ornamentBrush->SetColor(ToColorF(rgb, segmentAlpha));
-        g_renderTarget->DrawLine(
+        context.ornamentBrush->SetColor(ToColorF(rgb, segmentAlpha));
+        context.renderTarget->DrawLine(
             points[i],
             points[i + 1],
-            g_ornamentBrush,
+            context.ornamentBrush,
             width * (1.0f + taper * t),
-            g_strokeStyle);
+            context.strokeStyle);
     }
 }
 
 static void DrawOrnamentRope() {
-    if (!g_ornamentBrush || g_ornamentRopePointCount < 2) return;
+    if (!context.ornamentBrush || context.ornamentRopePointCount < 2) return;
     const float alpha =
-        std::clamp(g_ornamentRopeOpacity * g_ornamentOpacity, 0.0f, 1.0f);
+        std::clamp(context.ornamentRopeOpacity * context.ornamentOpacity, 0.0f, 1.0f);
     if (alpha <= kOrnamentMinDrawOpacity) return;
 
-    const D2D1_POINT_2F* points = g_ornamentRopePoints;
-    int count = g_ornamentRopePointCount;
+    const D2D1_POINT_2F* points = context.ornamentRopePoints;
+    int count = context.ornamentRopePointCount;
     const int first = SmoothOrnamentRope(
         points,
         count,
-        g_ornamentRopeSmoothA,
+        context.ornamentRopeSmoothA,
         kOrnamentMaxRopeDrawPoints);
     if (first >= 2) {
         const int second = SmoothOrnamentRope(
-            g_ornamentRopeSmoothA,
+            context.ornamentRopeSmoothA,
             first,
-            g_ornamentRopeSmoothB,
+            context.ornamentRopeSmoothB,
             kOrnamentMaxRopeDrawPoints);
         if (second >= 2) {
-            points = g_ornamentRopeSmoothB;
+            points = context.ornamentRopeSmoothB;
             count = second;
         }
     }
 
-    const float width = std::max(1.0f, g_ornamentRopeWidthPx * g_currentDpiScale);
-    switch (g_ornamentRopeStyle) {
+    const float width = std::max(1.0f, context.ornamentRopeWidthPx * context.currentDpiScale);
+    switch (context.ornamentRopeStyle) {
         case OrnamentRopeStyle::Silk:
             StrokeOrnamentRope(
-                points, count, width, alpha, g_currentCoreRGB, -0.4f);
+                points, count, width, alpha, context.currentCoreRGB, -0.4f);
             break;
         case OrnamentRopeStyle::Neon:
             StrokeOrnamentRope(
-                points, count, width * 3.6f, alpha * 0.16f, g_currentCoreRGB, 0.0f);
+                points, count, width * 3.6f, alpha * 0.16f, context.currentCoreRGB, 0.0f);
             StrokeOrnamentRope(
-                points, count, width * 2.0f, alpha * 0.28f, g_currentCoreRGB, 0.0f);
+                points, count, width * 2.0f, alpha * 0.28f, context.currentCoreRGB, 0.0f);
             StrokeOrnamentRope(
-                points, count, width, alpha, g_currentCoreRGB, 0.0f);
+                points, count, width, alpha, context.currentCoreRGB, 0.0f);
             break;
         case OrnamentRopeStyle::Chain:
             StrokeOrnamentRope(
-                points, count, width * 0.55f, alpha * 0.6f, g_currentCoreRGB, 0.0f);
-            for (int i = 1; i < g_ornamentRopePointCount; ++i) {
+                points, count, width * 0.55f, alpha * 0.6f, context.currentCoreRGB, 0.0f);
+            for (int i = 1; i < context.ornamentRopePointCount; ++i) {
                 const float t = static_cast<float>(i)
-                    / static_cast<float>(g_ornamentRopePointCount - 1);
-                g_ornamentBrush->SetColor(
-                    ToColorF(g_currentCoreRGB, alpha * (0.45f + 0.55f * t)));
+                    / static_cast<float>(context.ornamentRopePointCount - 1);
+                context.ornamentBrush->SetColor(
+                    ToColorF(context.currentCoreRGB, alpha * (0.45f + 0.55f * t)));
                 const float radius = width * 1.6f;
-                g_renderTarget->FillEllipse(
-                    D2D1::Ellipse(g_ornamentRopePoints[i], radius, radius),
-                    g_ornamentBrush);
+                context.renderTarget->FillEllipse(
+                    D2D1::Ellipse(context.ornamentRopePoints[i], radius, radius),
+                    context.ornamentBrush);
             }
             break;
         case OrnamentRopeStyle::Ribbon:
             StrokeOrnamentRope(
-                points, count, width * 3.2f, alpha * 0.3f, g_currentOuterRGB, 0.0f);
+                points, count, width * 3.2f, alpha * 0.3f, context.currentOuterRGB, 0.0f);
             StrokeOrnamentRope(
-                points, count, width * 1.1f, alpha, g_currentCoreRGB, 0.0f);
+                points, count, width * 1.1f, alpha, context.currentCoreRGB, 0.0f);
             break;
     }
 }
 
 static void DrawOrnament(const RECT& renderBounds) {
-    if (!g_ornamentAssetsReady || g_ornamentNodes.empty()) return;
+    if (!context.ornamentAssetsReady || context.ornamentNodes.empty()) return;
     const D2D1_MATRIX_3X2_F baseTransform = D2D1::Matrix3x2F::Translation(
         -static_cast<float>(renderBounds.left),
         -static_cast<float>(renderBounds.top));
-    g_renderTarget->SetTransform(baseTransform);
+    context.renderTarget->SetTransform(baseTransform);
     DrawOrnamentRope();
-    for (const OrnamentNode& node : g_ornamentNodes) {
-        const float alpha = std::clamp(node.opacity * g_ornamentOpacity, 0.0f, 1.0f);
+    for (const OrnamentNode& node : context.ornamentNodes) {
+        const float alpha = std::clamp(node.opacity * context.ornamentOpacity, 0.0f, 1.0f);
         if (alpha <= kOrnamentMinDrawOpacity) continue;
-        g_renderTarget->SetTransform(OrnamentNodeMatrix(node) * baseTransform);
+        context.renderTarget->SetTransform(OrnamentNodeMatrix(node) * baseTransform);
         const OrnamentImage* image = node.imageIndex >= 0
-            && node.imageIndex < static_cast<int>(g_ornamentImages.size())
-            ? &g_ornamentImages[static_cast<size_t>(node.imageIndex)]
+            && node.imageIndex < static_cast<int>(context.ornamentImages.size())
+            ? &context.ornamentImages[static_cast<size_t>(node.imageIndex)]
             : nullptr;
         if (image && image->bitmap) {
-            g_renderTarget->DrawBitmap(
+            context.renderTarget->DrawBitmap(
                 image->bitmap,
                 &node.localBounds,
                 alpha,
                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                 nullptr);
-        } else if (g_ornamentBrush) {
+        } else if (context.ornamentBrush) {
             const float width = node.localBounds.right - node.localBounds.left;
             const float height = node.localBounds.bottom - node.localBounds.top;
             if (width <= 0.0f || height <= 0.0f) continue;
-            g_ornamentBrush->SetColor(ToColorF(g_currentCoreRGB, alpha * 0.72f));
-            g_renderTarget->FillEllipse(
+            context.ornamentBrush->SetColor(ToColorF(context.currentCoreRGB, alpha * 0.72f));
+            context.renderTarget->FillEllipse(
                 D2D1::Ellipse(
                     D2D1::Point2F(
                         (node.localBounds.left + node.localBounds.right) * 0.5f,
                         (node.localBounds.top + node.localBounds.bottom) * 0.5f),
                     width * 0.5f,
                     height * 0.5f),
-                g_ornamentBrush);
+                context.ornamentBrush);
         }
     }
-    g_renderTarget->SetTransform(baseTransform);
+    context.renderTarget->SetTransform(baseTransform);
 }
+
+// One full overlay frame: trail layers, ripples and ornaments.
+
 
 bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
     // Node transforms feed only the ornament draw path, so skip them entirely
     // while the ornament is disabled.
-    if (g_ornamentEnabled) UpdateOrnamentDrawStates();
+    if (context.ornamentEnabled) UpdateOrnamentDrawStates();
     const bool ornamentVisible = OrnamentVisible();
-    bool drawTrail = g_historyCount >= 2;
-    const float speed = g_speedScaling ? (g_isSmearing ? g_smoothedSpeedNorm : g_frozenSpeedNorm) : 1.0f;
+    bool drawTrail = context.historyCount >= 2;
+    const float speed = context.speedScaling ? (context.isSmearing ? context.smoothedSpeedNorm : context.frozenSpeedNorm) : 1.0f;
     const int renderLength = GetEffectiveTailLength(speed);
-    const float outerHalf = (g_widthMin + (g_widthMax - g_widthMin) * speed) * g_currentDpiScale;
-    const float coreHalf = (g_coreWidthMin + (g_coreWidthMax - g_coreWidthMin) * speed) * g_currentDpiScale;
-    const float alphaScale = g_alphaMin + (g_alphaMax - g_alphaMin) * speed;
-    const float trailAlpha = alphaScale * g_fadeAlpha;
+    const float outerHalf = (context.widthMin + (context.widthMax - context.widthMin) * speed) * context.currentDpiScale;
+    const float coreHalf = (context.coreWidthMin + (context.coreWidthMax - context.coreWidthMin) * speed) * context.currentDpiScale;
+    const float alphaScale = context.alphaMin + (context.alphaMax - context.alphaMin) * speed;
+    const float trailAlpha = alphaScale * context.fadeAlpha;
 
     if (drawTrail) {
-        SmoothTrail(g_smoothIterations, renderLength);
-        drawTrail = g_renderCache.pointCount >= 2 && trailAlpha >= 0.02f;
+        SmoothTrail(context.smoothIterations, renderLength);
+        drawTrail = context.renderCache.pointCount >= 2 && trailAlpha >= 0.02f;
     }
 
     const int activeRippleCount = UpdateRippleState(nowQpc);
@@ -3685,35 +4402,35 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
     };
 
     if (drawTrail) {
-        const float boundsHalf = g_glowEnabled
-            ? outerHalf * std::max(1.0f, g_glowWidthFactor)
+        const float boundsHalf = context.glowEnabled
+            ? outerHalf * std::max(1.0f, context.glowWidthFactor)
             : outerHalf;
         includeBounds(CalculateTrailBounds(boundsHalf));
     }
 
     // These values originate from integer settings, so no floating-point round-up is needed.
-    const float scaledRippleRadius = g_rippleRadius * g_currentDpiScale;
-    const float scaledRippleStrokeWidth = g_rippleStrokeWidth * g_currentDpiScale;
-    const float scaledWheelArrowSize = g_wheelArrowSize * g_currentDpiScale;
-    const float scaledWheelArrowDistance = g_wheelArrowDistance * g_currentDpiScale;
+    const float scaledRippleRadius = context.rippleRadius * context.currentDpiScale;
+    const float scaledRippleStrokeWidth = context.rippleStrokeWidth * context.currentDpiScale;
+    const float scaledWheelArrowSize = context.wheelArrowSize * context.currentDpiScale;
+    const float scaledWheelArrowDistance = context.wheelArrowDistance * context.currentDpiScale;
     const LONG ripplePadding = static_cast<LONG>(
-        scaledRippleRadius + scaledRippleStrokeWidth + kRenderPadding * g_currentDpiScale + 1.0f);
+        scaledRippleRadius + scaledRippleStrokeWidth + kRenderPadding * context.currentDpiScale + 1.0f);
     const LONG wheelArrowPadding = static_cast<LONG>(ceilf(
         scaledWheelArrowDistance * 0.5f
         + scaledWheelArrowSize * 0.65f
         + scaledRippleStrokeWidth
-        + kRenderPadding * g_currentDpiScale
+        + kRenderPadding * context.currentDpiScale
         + 2.0f));
     const MotionAccent* newestMotionAccent = nullptr;
-    for (const MotionAccent& accent : g_motionAccents) {
+    for (const MotionAccent& accent : context.motionAccents) {
         if (accent.active && (!newestMotionAccent || accent.startQpc > newestMotionAccent->startQpc)) {
             newestMotionAccent = &accent;
         }
     }
-    const float scaledMotionAccentSize = g_motionAccentSize * g_currentDpiScale;
+    const float scaledMotionAccentSize = context.motionAccentSize * context.currentDpiScale;
     const LONG motionAccentPadding = static_cast<LONG>(
-        ceilf(scaledMotionAccentSize * 3.8f + kRenderPadding * g_currentDpiScale + 3.0f));
-    for (const MotionAccent& accent : g_motionAccents) {
+        ceilf(scaledMotionAccentSize * 3.8f + kRenderPadding * context.currentDpiScale + 3.0f));
+    for (const MotionAccent& accent : context.motionAccents) {
         if (!accent.active) continue;
         if (newestMotionAccent) {
             const int64_t deltaX = static_cast<int64_t>(accent.center.x) - newestMotionAccent->center.x;
@@ -3733,12 +4450,12 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
     }
 
     const RippleEffect* newestRipple = nullptr;
-    for (const RippleEffect& ripple : g_ripples) {
+    for (const RippleEffect& ripple : context.ripples) {
         if (ripple.active && (!newestRipple || ripple.startQpc > newestRipple->startQpc)) {
             newestRipple = &ripple;
         }
     }
-    for (const RippleEffect& ripple : g_ripples) {
+    for (const RippleEffect& ripple : context.ripples) {
         if (!ripple.active) continue;
         // A single layered window must submit one rectangular bitmap. Avoid a
         // huge allocation if interactions occur on distant monitors in quick
@@ -3769,24 +4486,24 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
     const int height = bounds.bottom - bounds.top;
     HDC screen = GetScreenDC();
     if (!screen || !EnsureBackbuffer(width, height, screen) || !EnsureD2DResources()) return false;
-    if (!g_dcBound) {
-        const RECT bindRect = {0, 0, g_cachedWidth, g_cachedHeight};
-        if (FAILED(g_renderTarget->BindDC(g_backBufferDc, &bindRect))) return false;
-        g_dcBound = true;
+    if (!context.dcBound) {
+        const RECT bindRect = {0, 0, context.cachedWidth, context.cachedHeight};
+        if (FAILED(context.renderTarget->BindDC(context.backBufferDc, &bindRect))) return false;
+        context.dcBound = true;
     }
 
     if (ornamentVisible) EnsureOrnamentBitmaps();
 
-    g_renderTarget->BeginDraw();
-    g_renderTarget->SetTransform(D2D1::Matrix3x2F::Translation(
+    context.renderTarget->BeginDraw();
+    context.renderTarget->SetTransform(D2D1::Matrix3x2F::Translation(
         -static_cast<float>(bounds.left), -static_cast<float>(bounds.top)));
     const D2D1_RECT_F clipBounds = D2D1::RectF(
         static_cast<float>(bounds.left),
         static_cast<float>(bounds.top),
         static_cast<float>(bounds.right),
         static_cast<float>(bounds.bottom));
-    g_renderTarget->PushAxisAlignedClip(clipBounds, D2D1_ANTIALIAS_MODE_ALIASED);
-    g_renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+    context.renderTarget->PushAxisAlignedClip(clipBounds, D2D1_ANTIALIAS_MODE_ALIASED);
+    context.renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
 
     if (drawTrail) {
         const D2D1_LAYER_PARAMETERS trailLayerParameters = D2D1::LayerParameters(
@@ -3795,43 +4512,43 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             D2D1::IdentityMatrix(),
             std::clamp(trailAlpha, 0.0f, 1.0f));
-        g_renderTarget->PushLayer(&trailLayerParameters, g_trailOpacityLayer);
+        context.renderTarget->PushLayer(&trailLayerParameters, context.trailOpacityLayer);
 
-        if (g_glowEnabled) {
+        if (context.glowEnabled) {
             const D2D1_LAYER_PARAMETERS glowLayerParameters = D2D1::LayerParameters(
                 clipBounds,
                 nullptr,
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 D2D1::IdentityMatrix(),
-                std::clamp(g_glowAlpha, 0.0f, 1.0f));
-            g_renderTarget->PushLayer(&glowLayerParameters, g_glowOpacityLayer);
-            ApplySolidBrushColor(g_glowBrush, g_glowRGB, g_glowBrushColorCache);
+                std::clamp(context.glowAlpha, 0.0f, 1.0f));
+            context.renderTarget->PushLayer(&glowLayerParameters, context.glowOpacityLayer);
+            ApplySolidBrushColor(context.glowBrush, context.glowRGB, context.glowBrushColorCache);
             DrawTrailLayer(
-                g_renderTarget,
-                g_glowBrush,
-                outerHalf * std::max(1.0f, g_glowWidthFactor));
-            g_renderTarget->PopLayer();
+                context.renderTarget,
+                context.glowBrush,
+                outerHalf * std::max(1.0f, context.glowWidthFactor));
+            context.renderTarget->PopLayer();
         }
 
-        ApplySolidBrushColor(g_outerBrush, g_currentOuterRGB, g_outerBrushColorCache);
-        ApplySolidBrushColor(g_coreBrush, g_currentCoreRGB, g_coreBrushColorCache);
-        DrawTrailLayer(g_renderTarget, g_outerBrush, outerHalf);
+        ApplySolidBrushColor(context.outerBrush, context.currentOuterRGB, context.outerBrushColorCache);
+        ApplySolidBrushColor(context.coreBrush, context.currentCoreRGB, context.coreBrushColorCache);
+        DrawTrailLayer(context.renderTarget, context.outerBrush, outerHalf);
 
-        ID2D1Brush* coreBrush = g_coreBrush;
-        if (g_gradientEnabled && EnsureGradientBrush()) {
-            g_gradientBrush->SetStartPoint(g_renderCache.activePoints[0]);
-            g_gradientBrush->SetEndPoint(
-                g_renderCache.activePoints[g_renderCache.pointCount - 1]);
-            g_gradientBrush->SetOpacity(1.0f);
-            coreBrush = g_gradientBrush;
+        ID2D1Brush* coreBrush = context.coreBrush;
+        if (context.gradientEnabled && EnsureGradientBrush()) {
+            context.gradientBrush->SetStartPoint(context.renderCache.activePoints[0]);
+            context.gradientBrush->SetEndPoint(
+                context.renderCache.activePoints[context.renderCache.pointCount - 1]);
+            context.gradientBrush->SetOpacity(1.0f);
+            coreBrush = context.gradientBrush;
         }
-        DrawTrailLayer(g_renderTarget, coreBrush, coreHalf);
-        g_renderTarget->PopLayer();
+        DrawTrailLayer(context.renderTarget, coreBrush, coreHalf);
+        context.renderTarget->PopLayer();
     }
 
     const LONGLONG accentDurationTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(g_motionAccentDurationMs) / 1000);
-    for (const MotionAccent& accent : g_motionAccents) {
+        1, context.qpcFrequency * static_cast<LONGLONG>(context.motionAccentDurationMs) / 1000);
+    for (const MotionAccent& accent : context.motionAccents) {
         if (!accent.active) continue;
         const LONGLONG deltaX = newestMotionAccent
             ? static_cast<LONGLONG>(accent.center.x) - newestMotionAccent->center.x
@@ -3851,7 +4568,7 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
             0.0f,
             1.0f);
         const float remaining = 1.0f - progress;
-        const float alpha = g_motionAccentOpacity * accent.intensity * remaining * remaining;
+        const float alpha = context.motionAccentOpacity * accent.intensity * remaining * remaining;
         if (alpha < 0.005f) continue;
 
         const float directionX = accent.directionX;
@@ -3872,23 +4589,23 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
 
         // Each cue uses a heavy contrast silhouette with a saturated color core.
         // This keeps the shape readable without sampling screen pixels every frame.
-        const float stroke = std::max(1.5f, g_currentDpiScale * (2.2f - 0.6f * progress));
-        const float outlineExtra = std::max(1.5f, g_currentDpiScale * 1.5f);
+        const float stroke = std::max(1.5f, context.currentDpiScale * (2.2f - 0.6f * progress));
+        const float outlineExtra = std::max(1.5f, context.currentDpiScale * 1.5f);
         const float visibleAlpha = std::clamp(alpha, 0.0f, 1.0f);
         const float accentLuminance =
-            0.2126f * static_cast<float>((g_motionAccentRGB >> 16) & 0xFF)
-            + 0.7152f * static_cast<float>((g_motionAccentRGB >> 8) & 0xFF)
-            + 0.0722f * static_cast<float>(g_motionAccentRGB & 0xFF);
+            0.2126f * static_cast<float>((context.motionAccentRGB >> 16) & 0xFF)
+            + 0.7152f * static_cast<float>((context.motionAccentRGB >> 8) & 0xFF)
+            + 0.0722f * static_cast<float>(context.motionAccentRGB & 0xFF);
         const uint32_t outlineRGB = accentLuminance >= 128.0f ? 0x00000000 : 0x00FFFFFF;
         const auto drawAccentLine = [&](const D2D1_POINT_2F& start,
                                         const D2D1_POINT_2F& end,
                                         float lineWidth) {
-            g_rippleBrush->SetColor(ToColorF(outlineRGB, visibleAlpha));
-            g_renderTarget->DrawLine(
-                start, end, g_rippleBrush, lineWidth + outlineExtra, g_strokeStyle);
-            g_rippleBrush->SetColor(ToColorF(g_motionAccentRGB, visibleAlpha));
-            g_renderTarget->DrawLine(
-                start, end, g_rippleBrush, lineWidth, g_strokeStyle);
+            context.rippleBrush->SetColor(ToColorF(outlineRGB, visibleAlpha));
+            context.renderTarget->DrawLine(
+                start, end, context.rippleBrush, lineWidth + outlineExtra, context.strokeStyle);
+            context.rippleBrush->SetColor(ToColorF(context.motionAccentRGB, visibleAlpha));
+            context.renderTarget->DrawLine(
+                start, end, context.rippleBrush, lineWidth, context.strokeStyle);
         };
 
         if (accent.kind == MotionAccentKind::Acceleration) {
@@ -3948,8 +4665,8 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
     }
 
     const LONGLONG durationTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(g_rippleDurationMs) / 1000);
-    for (const RippleEffect& ripple : g_ripples) {
+        1, context.qpcFrequency * static_cast<LONGLONG>(context.rippleDurationMs) / 1000);
+    for (const RippleEffect& ripple : context.ripples) {
         if (!ripple.active) continue;
         const LONGLONG elapsedTicks = nowQpc - ripple.startQpc;
         if (elapsedTicks < 0 || elapsedTicks >= durationTicks) continue;
@@ -3959,9 +4676,9 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
             1.0f);
         const float easedProgress = progress * (2.0f - progress);
         const float radius = (kRippleInitialRadius
-            + (g_rippleRadius - kRippleInitialRadius) * easedProgress) * g_currentDpiScale;
+            + (context.rippleRadius - kRippleInitialRadius) * easedProgress) * context.currentDpiScale;
         const float remaining = 1.0f - progress;
-        const float alpha = g_rippleOpacity * remaining * remaining;
+        const float alpha = context.rippleOpacity * remaining * remaining;
         if (alpha < 0.005f) continue;
 
         if (ripple.kind != RippleKind::Click) {
@@ -3997,46 +4714,46 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
                 arrowCenterX + directionX * arrowSize * 0.20f,
                 arrowCenterY + directionY * arrowSize * 0.20f);
 
-            g_rippleBrush->SetColor(ToColorF(ripple.color, alpha));
-            g_renderTarget->DrawLine(
-                shaftStart, shaftEnd, g_rippleBrush, scaledRippleStrokeWidth, g_strokeStyle);
-            g_renderTarget->DrawLine(
-                arrowTip, arrowLeft, g_rippleBrush, scaledRippleStrokeWidth, g_strokeStyle);
-            g_renderTarget->DrawLine(
-                arrowTip, arrowRight, g_rippleBrush, scaledRippleStrokeWidth, g_strokeStyle);
+            context.rippleBrush->SetColor(ToColorF(ripple.color, alpha));
+            context.renderTarget->DrawLine(
+                shaftStart, shaftEnd, context.rippleBrush, scaledRippleStrokeWidth, context.strokeStyle);
+            context.renderTarget->DrawLine(
+                arrowTip, arrowLeft, context.rippleBrush, scaledRippleStrokeWidth, context.strokeStyle);
+            context.renderTarget->DrawLine(
+                arrowTip, arrowRight, context.rippleBrush, scaledRippleStrokeWidth, context.strokeStyle);
             continue;
         }
 
-        g_rippleBrush->SetColor(ToColorF(ripple.color, alpha));
-        g_renderTarget->DrawEllipse(
+        context.rippleBrush->SetColor(ToColorF(ripple.color, alpha));
+        context.renderTarget->DrawEllipse(
             D2D1::Ellipse(
                 D2D1::Point2F(
                     static_cast<float>(ripple.center.x),
                     static_cast<float>(ripple.center.y)),
                 radius,
                 radius),
-            g_rippleBrush,
+            context.rippleBrush,
             scaledRippleStrokeWidth,
-            g_strokeStyle);
-        g_rippleBrush->SetColor(ToColorF(ripple.color, alpha * 0.58f));
+            context.strokeStyle);
+        context.rippleBrush->SetColor(ToColorF(ripple.color, alpha * 0.58f));
         const float innerRadius = radius * 0.58f;
-        g_renderTarget->DrawEllipse(
+        context.renderTarget->DrawEllipse(
             D2D1::Ellipse(
                 D2D1::Point2F(
                     static_cast<float>(ripple.center.x),
                     static_cast<float>(ripple.center.y)),
                 innerRadius,
                 innerRadius),
-            g_rippleBrush,
-            std::max(g_currentDpiScale * 1.5f, scaledRippleStrokeWidth * 0.78f),
-            g_strokeStyle);
+            context.rippleBrush,
+            std::max(context.currentDpiScale * 1.5f, scaledRippleStrokeWidth * 0.78f),
+            context.strokeStyle);
     }
 
     if (ornamentVisible) DrawOrnament(bounds);
 
-    g_renderTarget->PopAxisAlignedClip();
-    g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
-    const HRESULT drawResult = g_renderTarget->EndDraw();
+    context.renderTarget->PopAxisAlignedClip();
+    context.renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
+    const HRESULT drawResult = context.renderTarget->EndDraw();
     if (drawResult == D2DERR_RECREATE_TARGET) {
         ReleaseRenderResources();
         return false;
@@ -4055,24 +4772,27 @@ bool RenderOverlay(HWND hwnd, LONGLONG nowQpc) {
         screen,
         &position,
         &size,
-        g_backBufferDc,
+        context.backBufferDc,
         &bufferOrigin,
         0,
         &blend,
         ULW_ALPHA) != FALSE;
 }
 
+// Frame scheduling decisions for the overlay worker.
+
+
 // Pointer speed in pixels per second, derived from the real elapsed time between
 // samples. The worker is event-driven while idle and samples at up to 125 Hz while
 // effects are active, so a pixels-per-sample threshold would vary with the cadence.
 static float PointerSpeedPxPerSecond(const POINT& point, LONGLONG nowQpc) {
-    const LONGLONG elapsedTicks = nowQpc - g_lastSampleQpc;
-    g_lastSampleQpc = nowQpc;
-    const float dx = static_cast<float>(point.x - g_lastPos.x);
-    const float dy = static_cast<float>(point.y - g_lastPos.y);
-    g_lastPos = point;
-    const float dtSeconds = (g_qpcFrequency > 0 && elapsedTicks > 0)
-        ? static_cast<float>(elapsedTicks) / static_cast<float>(g_qpcFrequency)
+    const LONGLONG elapsedTicks = nowQpc - context.lastSampleQpc;
+    context.lastSampleQpc = nowQpc;
+    const float dx = static_cast<float>(point.x - context.lastPos.x);
+    const float dy = static_cast<float>(point.y - context.lastPos.y);
+    context.lastPos = point;
+    const float dtSeconds = (context.qpcFrequency > 0 && elapsedTicks > 0)
+        ? static_cast<float>(elapsedTicks) / static_cast<float>(context.qpcFrequency)
         : 0.0f;
     return sqrtf(dx * dx + dy * dy) / std::max(dtSeconds, 0.001f);
 }
@@ -4085,9 +4805,9 @@ bool SmearFrame(HWND hwnd, DWORD now, bool renderFrame) {
     if (UpdateCursorMonitorDpi(cursorMonitor)) {
         ResetTrailState();
         ResetMotionCueTracking();
-        g_ornamentPhysicsInitialized = false;
-        g_lastPos = point;
-        g_lastSampleQpc = sampleQpc;
+        context.ornamentPhysicsInitialized = false;
+        context.lastPos = point;
+        context.lastSampleQpc = sampleQpc;
     }
     const HWND foreground = GetForegroundWindow();
     const int appRule = CheckAppRuleCached(foreground);
@@ -4095,8 +4815,8 @@ bool SmearFrame(HWND hwnd, DWORD now, bool renderFrame) {
     // position and sample timestamp current so a later resume cannot interpret
     // the suppressed movement as one unusually fast cursor jump.
     const auto parkSample = [&] {
-        g_lastPos = point;
-        g_lastSampleQpc = sampleQpc;
+        context.lastPos = point;
+        context.lastSampleQpc = sampleQpc;
     };
 
     if (appRule < 0) {
@@ -4122,59 +4842,62 @@ bool SmearFrame(HWND hwnd, DWORD now, bool renderFrame) {
         return false;
     }
 
-    const LONGLONG sampleElapsedTicks = sampleQpc - g_lastSampleQpc;
+    const LONGLONG sampleElapsedTicks = sampleQpc - context.lastSampleQpc;
     const LONGLONG resumeGapTicks = std::max<LONGLONG>(
-        1, g_qpcFrequency * static_cast<LONGLONG>(kMotionResumeGapMs) / 1000);
-    if (g_lastSampleQpc <= 0
+        1, context.qpcFrequency * static_cast<LONGLONG>(kMotionResumeGapMs) / 1000);
+    if (context.lastSampleQpc <= 0
         || sampleElapsedTicks <= 0
         || sampleElapsedTicks > resumeGapTicks) {
         // Initialize or rebase instead of inferring speed across an invalid sample interval.
         ResetTrailState();
         ResetMotionCueTracking();
-        g_lastPos = point;
-        g_lastSampleQpc = sampleQpc;
+        context.lastPos = point;
+        context.lastSampleQpc = sampleQpc;
     }
 
-    const bool wasSmearing = g_isSmearing;
-    const int previousHistoryCount = g_historyCount;
-    const POINT previousPoint = g_lastPos;
+    const bool wasSmearing = context.isSmearing;
+    const int previousHistoryCount = context.historyCount;
+    const POINT previousPoint = context.lastPos;
     const float velocity = PointerSpeedPxPerSecond(point, sampleQpc);
     UpdateMotionCueTracking(point, sampleQpc);
     UpdateTrailState(previousPoint, point, velocity);
     UpdateOrnamentPhysics(velocity, sampleQpc);
     MaybeReleaseIdleBackbuffer(now, sampleQpc);
-    if (g_isSmearing || g_historyCount >= 2) UpdateTrailColorIfNeeded(now, point);
+    if (context.isSmearing || context.historyCount >= 2) UpdateTrailColorIfNeeded(now, point);
 
-    const bool stateChanged = wasSmearing != g_isSmearing
-        || (previousHistoryCount >= 2) != (g_historyCount >= 2);
+    const bool stateChanged = wasSmearing != context.isSmearing
+        || (previousHistoryCount >= 2) != (context.historyCount >= 2);
     const bool hasRipples = HasActiveRipples(sampleQpc);
     const bool hasMotionAccents = HasActiveMotionAccents(sampleQpc);
     const bool ornamentVisible = OrnamentVisible();
-    if (g_historyCount < 2 && !hasRipples && !hasMotionAccents && !ornamentVisible) {
+    if (context.historyCount < 2 && !hasRipples && !hasMotionAccents && !ornamentVisible) {
         HideOverlay();
         return false;
     }
     const bool ornamentRedrawDue = ornamentVisible
-        && g_ornamentRedrawPending
-        && sampleQpc >= g_ornamentNextRenderQpc;
+        && context.ornamentRedrawPending
+        && sampleQpc >= context.ornamentNextRenderQpc;
     if (!renderFrame && !stateChanged && !ornamentRedrawDue) return false;
     if (!RenderOverlay(hwnd, sampleQpc)) {
         HideOverlay();
         return false;
     }
-    g_ornamentRedrawPending = false;
-    if (g_qpcFrequency > 0) {
-        g_ornamentNextRenderQpc = sampleQpc
-            + std::max<LONGLONG>(1, g_qpcFrequency / kActiveRenderFrameRate);
+    context.ornamentRedrawPending = false;
+    if (context.qpcFrequency > 0) {
+        context.ornamentNextRenderQpc = sampleQpc
+            + std::max<LONGLONG>(1, context.qpcFrequency / kActiveRenderFrameRate);
     }
     ShowOverlay();
     return true;
 }
 
+// Overlay window procedure and frame timer helpers.
+
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case kSettingsChangedMessage:
-        g_settingsDirty.store(true, std::memory_order_release);
+        context.settingsDirty.store(true, std::memory_order_release);
         return 0;
     case WM_INPUT: {
         RAWINPUT rawInput = {};
@@ -4194,20 +4917,20 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 | RI_MOUSE_MIDDLE_BUTTON_DOWN;
             const bool clickDown = (buttons & clickDownMask) != 0;
             const bool wheelDown = (buttons & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) != 0;
-            const bool clickEvent = g_clickFeedbackEnabled && clickDown;
-            const bool wheelEvent = g_wheelFeedbackEnabled && wheelDown;
+            const bool clickEvent = context.clickFeedbackEnabled && clickDown;
+            const bool wheelEvent = context.wheelFeedbackEnabled && wheelDown;
             if (clickEvent || wheelEvent) {
                 POINT interactionPoint = {};
                 if (GetCursorPos(&interactionPoint)) {
-                    if (g_clickFeedbackEnabled) {
+                    if (context.clickFeedbackEnabled) {
                         if (buttons & RI_MOUSE_LEFT_BUTTON_DOWN) {
-                            AddRipple(interactionPoint, g_leftClickRGB);
+                            AddRipple(interactionPoint, context.leftClickRGB);
                         }
                         if (buttons & RI_MOUSE_RIGHT_BUTTON_DOWN) {
-                            AddRipple(interactionPoint, g_rightClickRGB);
+                            AddRipple(interactionPoint, context.rightClickRGB);
                         }
                         if (buttons & RI_MOUSE_MIDDLE_BUTTON_DOWN) {
-                            AddRipple(interactionPoint, g_middleClickRGB);
+                            AddRipple(interactionPoint, context.middleClickRGB);
                         }
                     }
                     if (wheelEvent) {
@@ -4229,7 +4952,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                                         : RippleKind::WheelDown);
                             AddRipple(
                                 interactionPoint,
-                                wheelDelta > 0 ? g_wheelUpRGB : g_wheelDownRGB,
+                                wheelDelta > 0 ? context.wheelUpRGB : context.wheelDownRGB,
                                 kind);
                         }
                     }
@@ -4237,18 +4960,18 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             }
 
             // Pendant reactions do not depend on the ripple feedback settings.
-            if (g_ornamentEnabled && (clickDown || wheelDown)) {
+            if (context.ornamentEnabled && (clickDown || wheelDown)) {
                 const LONGLONG reactionQpc = QpcNow();
                 if (clickDown) {
-                    QueueOrnamentImpulse(-g_ornamentClickImpulse, reactionQpc);
+                    QueueOrnamentImpulse(-context.ornamentClickImpulse, reactionQpc);
                 }
                 if ((buttons & RI_MOUSE_WHEEL) != 0) {
                     const SHORT wheelDelta = static_cast<SHORT>(mouse.usButtonData);
                     if (wheelDelta != 0) {
                         QueueOrnamentImpulse(
                             wheelDelta > 0
-                                ? -g_ornamentWheelImpulse
-                                : g_ornamentWheelImpulse,
+                                ? -context.ornamentWheelImpulse
+                                : context.ornamentWheelImpulse,
                             reactionQpc);
                     }
                 }
@@ -4258,16 +4981,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 || mouse.lLastY != 0
                 || (mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0;
             if (moved) {
-                g_rawMouseMovementPending = true;
+                context.rawMouseMovementPending = true;
                 const LONGLONG currentQpc = QpcNow();
                 const LONGLONG wakeInterval = std::max<LONGLONG>(
-                    1, g_qpcFrequency * kInputWakeThrottleMs / 1000);
-                if (!g_rawInputWakePending
-                    && (g_lastRawInputWakeQpc == 0
-                        || currentQpc - g_lastRawInputWakeQpc >= wakeInterval)) {
-                    g_lastRawInputWakeQpc = currentQpc;
-                    g_rawInputWakePending = true;
-                    if (g_inputWakeEvent) SetEvent(g_inputWakeEvent);
+                    1, context.qpcFrequency * kInputWakeThrottleMs / 1000);
+                if (!context.rawInputWakePending
+                    && (context.lastRawInputWakeQpc == 0
+                        || currentQpc - context.lastRawInputWakeQpc >= wakeInterval)) {
+                    context.lastRawInputWakeQpc = currentQpc;
+                    context.rawInputWakePending = true;
+                    if (context.inputWakeEvent) SetEvent(context.inputWakeEvent);
                 }
             }
         }
@@ -4278,12 +5001,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         ReleaseBackbuffer();
         ReleaseBackgroundSampler();
         ReleaseScreenDC();
-        g_lastFullscreenStrongCheck = 0;
-        g_nextSampleDeadline = 0;
-        g_cursorMonitor = nullptr;
-        g_cursorDpi = 96;
-        g_currentDpiScale = 1.0f;
-        g_ornamentPhysicsInitialized = false;
+        context.lastFullscreenStrongCheck = 0;
+        context.nextSampleDeadline = 0;
+        context.cursorMonitor = nullptr;
+        context.cursorDpi = 96;
+        context.currentDpiScale = 1.0f;
+        context.ornamentPhysicsInitialized = false;
         ResetAutoColorSamplingCache();
         return 0;
     case WM_CLOSE:
@@ -4296,8 +5019,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
-
-
 static bool ArmFrameTimer(HANDLE timer, LONGLONG deadline, LONGLONG frequency) {
     const LONGLONG now = QpcNow();
     LONGLONG ticks = deadline - now;
@@ -4312,6 +5033,9 @@ static LONGLONG FrameIntervalTicks(LONGLONG frequency, int frameRate) {
     return std::max<LONGLONG>(1, frequency / frameRate);
 }
 
+// The dedicated overlay worker thread.
+
+
 DWORD WINAPI OverlayThreadProc(LPVOID) {
     const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(coResult)) return 0;
@@ -4320,9 +5044,9 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
         CoUninitialize();
         return 0;
     }
-    g_qpcFrequency = qpcFrequency.QuadPart;
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2dFactory);
-    if (FAILED(hr) || !g_d2dFactory) {
+    context.qpcFrequency = qpcFrequency.QuadPart;
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &context.d2dFactory);
+    if (FAILED(hr) || !context.d2dFactory) {
         CoUninitialize();
         return 0;
     }
@@ -4335,8 +5059,8 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
     windowClass.lpszClassName = className;
     const ATOM atom = RegisterClassW(&windowClass);
     if (!atom) {
-        g_d2dFactory->Release();
-        g_d2dFactory = nullptr;
+        context.d2dFactory->Release();
+        context.d2dFactory = nullptr;
         CoUninitialize();
         return 0;
     }
@@ -4356,44 +5080,44 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
         nullptr);
     if (!hwnd) {
         UnregisterClassW(className, instance);
-        g_d2dFactory->Release();
-        g_d2dFactory = nullptr;
+        context.d2dFactory->Release();
+        context.d2dFactory = nullptr;
         CoUninitialize();
         return 0;
     }
 
-    g_overlayHwnd.store(hwnd, std::memory_order_release);
+    context.overlayHwnd.store(hwnd, std::memory_order_release);
     ApplyOverlayCaptureAffinity();
     HideOverlay();
     POINT initialCursorPosition = {};
     if (GetCursorPos(&initialCursorPosition)) {
         UpdateCursorMonitorDpi(
             MonitorFromPoint(initialCursorPosition, MONITOR_DEFAULTTONEAREST));
-        g_lastPos = initialCursorPosition;
+        context.lastPos = initialCursorPosition;
     }
-    g_lastSampleQpc = QpcNow();
-    g_fullscreenForegroundWindow = nullptr;
-    g_lastFullscreenStrongCheck = 0;
-    g_fullscreenStrongSignal = false;
-    g_fullscreenSuppressed = false;
-    g_fullscreenFalseSince = 0;
-    if (g_settingsDirty.exchange(false, std::memory_order_acq_rel)) LoadSettings();
+    context.lastSampleQpc = QpcNow();
+    context.fullscreenForegroundWindow = nullptr;
+    context.lastFullscreenStrongCheck = 0;
+    context.fullscreenStrongSignal = false;
+    context.fullscreenSuppressed = false;
+    context.fullscreenFalseSince = 0;
+    if (context.settingsDirty.exchange(false, std::memory_order_acq_rel)) LoadSettings();
 
     HANDLE frameTimer = CreateWaitableTimerExW(
         nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!frameTimer) frameTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     if (!frameTimer) {
         DestroyWindow(hwnd);
-        g_overlayHwnd.store(nullptr, std::memory_order_release);
+        context.overlayHwnd.store(nullptr, std::memory_order_release);
         UnregisterClassW(className, instance);
-        g_d2dFactory->Release();
-        g_d2dFactory = nullptr;
+        context.d2dFactory->Release();
+        context.d2dFactory = nullptr;
         CoUninitialize();
         return 0;
     }
 
-    g_rawInputRegistered = RegisterMouseRawInput(hwnd, true);
-    g_foregroundEventHook = SetWinEventHook(
+    context.rawInputRegistered = RegisterMouseRawInput(hwnd, true);
+    context.foregroundEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_FOREGROUND,
         nullptr,
@@ -4401,7 +5125,7 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
         0,
         0,
         WINEVENT_OUTOFCONTEXT);
-    if (!g_foregroundEventHook) {
+    if (!context.foregroundEventHook) {
         Wh_Log(L"SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed: %lu", GetLastError());
     }
     RefreshForegroundInputState();
@@ -4419,53 +5143,53 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
     bool running = true;
 
     while (running) {
-        if (g_settingsDirty.exchange(false, std::memory_order_acq_rel)) {
+        if (context.settingsDirty.exchange(false, std::memory_order_acq_rel)) {
             LoadSettings();
             EnsureOrnamentAssetsLoaded();
             SmearFrame(hwnd, GetTickCount(), true);
         }
 
         const LONGLONG currentQpc = QpcNow();
-        const bool trailActive = g_isSmearing || g_historyCount >= 2;
+        const bool trailActive = context.isSmearing || context.historyCount >= 2;
         const bool rippleActive = HasActiveRipples(currentQpc) || HasActiveMotionAccents(currentQpc);
         const bool ornamentActive = OrnamentActive();
         const LONGLONG inputWakeInterval = std::max<LONGLONG>(
             1,
-            g_qpcFrequency * static_cast<LONGLONG>(kInputWakeThrottleMs) / 1000);
+            context.qpcFrequency * static_cast<LONGLONG>(kInputWakeThrottleMs) / 1000);
         const bool inputCatchUpNeeded =
-            g_rawMouseMovementPending && !g_rawInputWakePending && !ornamentActive;
+            context.rawMouseMovementPending && !context.rawInputWakePending && !ornamentActive;
         const bool sampleTimerNeeded =
-            trailActive || rippleActive || ornamentActive || g_pollingFallback || inputCatchUpNeeded;
+            trailActive || rippleActive || ornamentActive || context.pollingFallback || inputCatchUpNeeded;
         bool trimTimerNeeded = false;
 
         LONGLONG timerDeadline = 0;
         if (sampleTimerNeeded) {
-            if (inputCatchUpNeeded && !trailActive && !rippleActive && !ornamentActive && !g_pollingFallback) {
+            if (inputCatchUpNeeded && !trailActive && !rippleActive && !ornamentActive && !context.pollingFallback) {
                 // If the input wake was coalesced by the throttle, schedule one
                 // bounded wake rather than waiting indefinitely and losing the
                 // final sub-interval of a short movement burst.
-                g_nextSampleDeadline = std::max(
+                context.nextSampleDeadline = std::max(
                     currentQpc + 1,
-                    g_lastRawInputWakeQpc + inputWakeInterval);
-            } else if (g_nextSampleDeadline <= currentQpc) {
+                    context.lastRawInputWakeQpc + inputWakeInterval);
+            } else if (context.nextSampleDeadline <= currentQpc) {
                 const LONGLONG interval = (trailActive || rippleActive || ornamentActive)
                     ? simulationTicks
                     : GetFallbackPollIntervalTicks();
-                g_nextSampleDeadline = currentQpc + interval;
+                context.nextSampleDeadline = currentQpc + interval;
             }
-            timerDeadline = g_nextSampleDeadline;
-        } else if (g_backBufferDc && g_backBufferBitmap) {
+            timerDeadline = context.nextSampleDeadline;
+        } else if (context.backBufferDc && context.backBufferBitmap) {
             MaybeReleaseIdleBackbuffer(GetTickCount(), currentQpc);
-            if (g_backBufferDc && g_backBufferBitmap) {
+            if (context.backBufferDc && context.backBufferBitmap) {
                 const DWORD nowTicks = GetTickCount();
-                const DWORD elapsed = nowTicks - g_backbufferIdleSince;
+                const DWORD elapsed = nowTicks - context.backbufferIdleSince;
                 const DWORD remaining = elapsed >= kBackbufferIdleReleaseDelayMs
                     ? 1
                     : kBackbufferIdleReleaseDelayMs - elapsed;
                 timerDeadline = QpcNow()
                     + std::max<LONGLONG>(
                         1,
-                        g_qpcFrequency * static_cast<LONGLONG>(remaining) / 1000);
+                        context.qpcFrequency * static_cast<LONGLONG>(remaining) / 1000);
                 trimTimerNeeded = true;
             }
         }
@@ -4477,7 +5201,7 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
             CancelWaitableTimer(frameTimer);
         }
 
-        HANDLE handles[] = {g_stopEvent, g_inputWakeEvent, frameTimer};
+        HANDLE handles[] = {context.stopEvent, context.inputWakeEvent, frameTimer};
         const DWORD handleCount = timerNeeded ? 3 : 2;
         const DWORD waitResult = MsgWaitForMultipleObjectsEx(
             handleCount,
@@ -4492,92 +5216,92 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
         }
 
         if (waitResult == WAIT_OBJECT_0 + 1) {
-            g_rawInputWakePending = false;
-            const bool foregroundChanged = g_foregroundChangePending;
-            const bool interactionTriggered = g_interactionPending;
-            const bool rawMovement = g_rawMouseMovementPending;
-            g_interactionPending = false;
+            context.rawInputWakePending = false;
+            const bool foregroundChanged = context.foregroundChangePending;
+            const bool interactionTriggered = context.interactionPending;
+            const bool rawMovement = context.rawMouseMovementPending;
+            context.interactionPending = false;
 
             if (foregroundChanged) {
                 RefreshForegroundInputState();
                 // Recheck the new foreground immediately. UpdateFullscreenState
                 // retains normal same-monitor exit hysteresis but releases
                 // suppression for the desktop shell or a different cursor monitor.
-                g_fullscreenForegroundWindow = nullptr;
-                g_lastFullscreenStrongCheck = 0;
+                context.fullscreenForegroundWindow = nullptr;
+                context.lastFullscreenStrongCheck = 0;
             }
 
             if (foregroundChanged || interactionTriggered) {
-                g_rawMouseMovementPending = false;
+                context.rawMouseMovementPending = false;
                 const LONGLONG eventQpc = QpcNow();
                 const bool forceRender = interactionTriggered;
                 const bool rendered = SmearFrame(hwnd, GetTickCount(), forceRender);
                 const bool activeAfterEvent =
-                    g_isSmearing || g_historyCount >= 2
+                    context.isSmearing || context.historyCount >= 2
                     || HasActiveRipples(QpcNow())
                     || HasActiveMotionAccents(QpcNow())
                     || OrnamentActive();
                 if (activeAfterEvent) {
-                    const bool fastActive = g_isSmearing || g_historyCount >= 2 || OrnamentActive();
+                    const bool fastActive = context.isSmearing || context.historyCount >= 2 || OrnamentActive();
                     nextRenderDeadline = eventQpc
                         + (fastActive
                             ? activeRenderTicks
                             : fadeRenderTicks);
-                    g_nextSampleDeadline = eventQpc + simulationTicks;
+                    context.nextSampleDeadline = eventQpc + simulationTicks;
                 } else {
-                    g_nextSampleDeadline = g_pollingFallback
+                    context.nextSampleDeadline = context.pollingFallback
                         ? eventQpc + GetFallbackPollIntervalTicks()
                         : 0;
                 }
                 (void)rendered;
             } else if (rawMovement) {
-                g_rawMouseMovementPending = false;
+                context.rawMouseMovementPending = false;
                 const LONGLONG movementQpc = QpcNow();
                 const bool activeBeforeMovement =
-                    g_isSmearing || g_historyCount >= 2
+                    context.isSmearing || context.historyCount >= 2
                     || HasActiveRipples(movementQpc)
                     || HasActiveMotionAccents(movementQpc);
 
-                if (!activeBeforeMovement && !g_pollingFallback) {
+                if (!activeBeforeMovement && !context.pollingFallback) {
                     // Bound the first post-idle interval instead of dividing by
                     // the entire idle duration. This retains the first movement
                     // burst even when no second hardware report follows it.
                     const LONGLONG initialSampleTicks = std::max<LONGLONG>(
                         1,
-                        g_qpcFrequency * static_cast<LONGLONG>(kInputWakeThrottleMs) / 2000);
-                    g_lastSampleQpc = movementQpc - initialSampleTicks;
+                        context.qpcFrequency * static_cast<LONGLONG>(kInputWakeThrottleMs) / 2000);
+                    context.lastSampleQpc = movementQpc - initialSampleTicks;
                     const bool renderFrame = movementQpc >= nextRenderDeadline;
                     SmearFrame(hwnd, GetTickCount(), renderFrame);
                     const LONGLONG sampledQpc = QpcNow();
                     const bool activeAfterMovement =
-                        g_isSmearing || g_historyCount >= 2
+                        context.isSmearing || context.historyCount >= 2
                         || HasActiveRipples(sampledQpc)
                         || HasActiveMotionAccents(sampledQpc)
                         || OrnamentActive();
-                    g_nextSampleDeadline = sampledQpc
+                    context.nextSampleDeadline = sampledQpc
                         + (activeAfterMovement ? simulationTicks : 0);
                     if (activeAfterMovement && (renderFrame || sampledQpc >= nextRenderDeadline)) {
                         nextRenderDeadline = sampledQpc
-                            + ((g_isSmearing || g_historyCount >= 2 || OrnamentActive())
+                            + ((context.isSmearing || context.historyCount >= 2 || OrnamentActive())
                                 ? activeRenderTicks
                                 : fadeRenderTicks);
                     }
-                } else if (movementQpc >= g_nextSampleDeadline || !activeBeforeMovement) {
+                } else if (movementQpc >= context.nextSampleDeadline || !activeBeforeMovement) {
                     const bool renderFrame = movementQpc >= nextRenderDeadline;
                     SmearFrame(hwnd, GetTickCount(), renderFrame);
                     const LONGLONG sampledQpc = QpcNow();
                     const bool activeAfterMovement =
-                        g_isSmearing || g_historyCount >= 2
+                        context.isSmearing || context.historyCount >= 2
                         || HasActiveRipples(sampledQpc)
                         || HasActiveMotionAccents(sampledQpc)
                         || OrnamentActive();
-                    g_nextSampleDeadline = sampledQpc
+                    context.nextSampleDeadline = sampledQpc
                         + (activeAfterMovement
                             ? simulationTicks
-                            : (g_pollingFallback ? GetFallbackPollIntervalTicks() : 0));
+                            : (context.pollingFallback ? GetFallbackPollIntervalTicks() : 0));
                     if (activeAfterMovement && (renderFrame || sampledQpc >= nextRenderDeadline)) {
                         nextRenderDeadline = sampledQpc
-                            + ((g_isSmearing || g_historyCount >= 2 || OrnamentActive())
+                            + ((context.isSmearing || context.historyCount >= 2 || OrnamentActive())
                                 ? activeRenderTicks
                                 : fadeRenderTicks);
                     }
@@ -4594,18 +5318,18 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
                     || HasActiveMotionAccents(sampleNow)
                     || OrnamentActive();
                 const bool renderFrame =
-                    (g_isSmearing || g_historyCount >= 2 || interactionActiveBeforeFrame || OrnamentActive())
+                    (context.isSmearing || context.historyCount >= 2 || interactionActiveBeforeFrame || OrnamentActive())
                     && sampleNow >= nextRenderDeadline;
                 const bool rendered = SmearFrame(hwnd, GetTickCount(), renderFrame);
-                g_rawMouseMovementPending = false;
+                context.rawMouseMovementPending = false;
 
                 const LONGLONG sampledQpc = QpcNow();
                 const bool interactionActive =
                     HasActiveRipples(sampledQpc)
                     || HasActiveMotionAccents(sampledQpc)
                     || OrnamentActive();
-                const bool active = g_isSmearing || OrnamentActive();
-                const bool fading = !active && g_historyCount >= 2;
+                const bool active = context.isSmearing || OrnamentActive();
+                const bool fading = !active && context.historyCount >= 2;
                 if (active || fading || interactionActive) {
                     const LONGLONG interval = (active || interactionActive)
                         ? activeRenderTicks
@@ -4613,15 +5337,15 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
                     if (rendered || sampledQpc >= nextRenderDeadline) {
                         nextRenderDeadline = sampledQpc + interval;
                     }
-                    g_nextSampleDeadline = sampledQpc + simulationTicks;
-                } else if (g_pollingFallback) {
-                    g_nextSampleDeadline = sampledQpc + GetFallbackPollIntervalTicks();
+                    context.nextSampleDeadline = sampledQpc + simulationTicks;
+                } else if (context.pollingFallback) {
+                    context.nextSampleDeadline = sampledQpc + GetFallbackPollIntervalTicks();
                 } else {
-                    g_nextSampleDeadline = 0;
+                    context.nextSampleDeadline = 0;
                 }
             } else if (trimTimerNeeded) {
                 MaybeReleaseIdleBackbuffer(GetTickCount(), QpcNow());
-                g_nextSampleDeadline = 0;
+                context.nextSampleDeadline = 0;
             }
             continue;
         }
@@ -4643,15 +5367,15 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
 
     CancelWaitableTimer(frameTimer);
     CloseHandle(frameTimer);
-    if (g_foregroundEventHook) {
-        if (!UnhookWinEvent(g_foregroundEventHook)) {
+    if (context.foregroundEventHook) {
+        if (!UnhookWinEvent(context.foregroundEventHook)) {
             Wh_Log(L"UnhookWinEvent failed: %lu", GetLastError());
         }
-        g_foregroundEventHook = nullptr;
+        context.foregroundEventHook = nullptr;
     }
-    if (g_rawInputRegistered && hwnd) {
+    if (context.rawInputRegistered && hwnd) {
         RegisterMouseRawInput(hwnd, false);
-        g_rawInputRegistered = false;
+        context.rawInputRegistered = false;
     }
     ClearRipples();
     HideOverlay();
@@ -4659,11 +5383,11 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
     ReleaseBackbuffer();
     ReleaseBackgroundSampler();
     ReleaseScreenDC();
-    if (g_d2dFactory) {
-        g_d2dFactory->Release();
-        g_d2dFactory = nullptr;
+    if (context.d2dFactory) {
+        context.d2dFactory->Release();
+        context.d2dFactory = nullptr;
     }
-    g_overlayHwnd.store(nullptr, std::memory_order_release);
+    context.overlayHwnd.store(nullptr, std::memory_order_release);
     DestroyWindow(hwnd);
     UnregisterClassW(className, instance);
     CoUninitialize();
@@ -4672,48 +5396,47 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
 
 BOOL WhTool_ModInit() {
     LoadSettings();
-    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_stopEvent) return FALSE;
-    g_inputWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_inputWakeEvent) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
+    context.stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!context.stopEvent) return FALSE;
+    context.inputWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!context.inputWakeEvent) {
+        CloseHandle(context.stopEvent);
+        context.stopEvent = nullptr;
         return FALSE;
     }
-    g_threadHandle = CreateThread(nullptr, 0, OverlayThreadProc, nullptr, 0, nullptr);
-    if (!g_threadHandle) {
-        CloseHandle(g_inputWakeEvent);
-        g_inputWakeEvent = nullptr;
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
+    context.threadHandle = CreateThread(nullptr, 0, OverlayThreadProc, nullptr, 0, nullptr);
+    if (!context.threadHandle) {
+        CloseHandle(context.inputWakeEvent);
+        context.inputWakeEvent = nullptr;
+        CloseHandle(context.stopEvent);
+        context.stopEvent = nullptr;
         return FALSE;
     }
     return TRUE;
 }
 
 void WhTool_ModUninit() {
-    if (g_stopEvent) SetEvent(g_stopEvent);
-    if (g_threadHandle) {
-        WaitForSingleObject(g_threadHandle, INFINITE);
-        CloseHandle(g_threadHandle);
-        g_threadHandle = nullptr;
+    if (context.stopEvent) SetEvent(context.stopEvent);
+    if (context.threadHandle) {
+        WaitForSingleObject(context.threadHandle, INFINITE);
+        CloseHandle(context.threadHandle);
+        context.threadHandle = nullptr;
     }
-    if (g_inputWakeEvent) {
-        CloseHandle(g_inputWakeEvent);
-        g_inputWakeEvent = nullptr;
+    if (context.inputWakeEvent) {
+        CloseHandle(context.inputWakeEvent);
+        context.inputWakeEvent = nullptr;
     }
-    if (g_stopEvent) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
+    if (context.stopEvent) {
+        CloseHandle(context.stopEvent);
+        context.stopEvent = nullptr;
     }
 }
 
 void WhTool_ModSettingsChanged() {
-    g_settingsDirty.store(true, std::memory_order_release);
-    HWND hwnd = g_overlayHwnd.load(std::memory_order_acquire);
-    if (hwnd && IsWindow(hwnd)) PostMessageW(hwnd, kSettingsChangedMessage, 0, 0);
+    context.settingsDirty.store(true, std::memory_order_release);
+    HWND hwnd = context.overlayHwnd.load(std::memory_order_acquire);
+    if (yoko::win32::IsValidWindow(hwnd)) PostMessageW(hwnd, kSettingsChangedMessage, 0, 0);
 }
-
 ////////////////////////////////////////////////////////////////////////////////
 // Windhawk tool mod implementation for mods which don't need to inject to other
 // processes or hook other functions. Context:
@@ -4727,9 +5450,6 @@ void WhTool_ModSettingsChanged() {
 // * WhTool_ModUninit
 //
 // Currently, other callbacks are not supported.
-
-bool g_isToolModProcessLauncher;
-HANDLE g_toolModProcessMutex;
 
 void WINAPI EntryPoint_Hook() {
     Wh_Log(L">");
@@ -4779,15 +5499,17 @@ BOOL Wh_ModInit() {
     }
 
     if (isCurrentToolModProcess) {
-        g_toolModProcessMutex =
+        context.toolModProcessMutex =
             CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-        if (!g_toolModProcessMutex) {
+        if (!context.toolModProcessMutex) {
             Wh_Log(L"CreateMutex failed");
             ExitProcess(1);
         }
 
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+            CloseHandle(context.toolModProcessMutex);
+            context.toolModProcessMutex = nullptr;
             ExitProcess(1);
         }
 
@@ -4795,15 +5517,18 @@ BOOL Wh_ModInit() {
             ExitProcess(1);
         }
 
-        IMAGE_DOS_HEADER* dosHeader =
-            (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
-        IMAGE_NT_HEADERS* ntHeaders =
-            (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
+        void* entryPoint = nullptr;
+        if (!yoko::win32::FindModuleEntryPoint(GetModuleHandle(nullptr), &entryPoint)) {
+            Wh_Log(L"Unable to resolve the process entry point");
+            WhTool_ModUninit();
+            ExitProcess(1);
+        }
 
-        DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-        void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
-
-        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
+        if (!Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr)) {
+            Wh_Log(L"Wh_SetFunctionHook failed for the process entry point");
+            WhTool_ModUninit();
+            ExitProcess(1);
+        }
         return TRUE;
     }
 
@@ -4811,12 +5536,12 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    g_isToolModProcessLauncher = true;
+    context.isToolModProcessLauncher = true;
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    if (!g_isToolModProcessLauncher) {
+    if (!context.isToolModProcessLauncher) {
         return;
     }
 
@@ -4860,11 +5585,10 @@ void Wh_ModAfterInit() {
         return;
     }
 
-    STARTUPINFO si{
-        .cb = sizeof(STARTUPINFO),
-        .dwFlags = STARTF_FORCEOFFFEEDBACK,
-    };
-    PROCESS_INFORMATION pi;
+    STARTUPINFO si = {};
+    si.cb = sizeof(STARTUPINFO);
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK;
+    PROCESS_INFORMATION pi = {};
     if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
                                  nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
                                  nullptr, nullptr, &si, &pi, nullptr)) {
@@ -4872,12 +5596,12 @@ void Wh_ModAfterInit() {
         return;
     }
 
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    yoko::win32::UniqueHandle processHandle(pi.hProcess);
+    yoko::win32::UniqueHandle threadHandle(pi.hThread);
 }
 
 void Wh_ModSettingsChanged() {
-    if (g_isToolModProcessLauncher) {
+    if (context.isToolModProcessLauncher) {
         return;
     }
 
@@ -4885,7 +5609,7 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModUninit() {
-    if (g_isToolModProcessLauncher) {
+    if (context.isToolModProcessLauncher) {
         return;
     }
 
